@@ -16,17 +16,31 @@ Reliability:
   was found is ``AllSearchProvidersFailedError`` raised.
 
 Every provider call is recorded as a ``SearchAttempt`` (provenance + observability).
+
+Timeouts: besides the HTTP client's per-operation timeout inside each adapter, every provider
+try is bounded by ``options.timeout_s`` of wall-clock time at service level
+(``ProviderTimeoutError``, category ``TIMEOUT``, retryable).
+
+Observability: each run has a ``request_id`` bound to every log line; queries are logged
+only as ``query_hash`` (SHA-256 prefix) + length, never verbatim.
+
+``SearchRun.to_response()`` builds the ``SearchResponse`` with deterministic ordering:
+hits sorted by (query order, provider priority, provider rank); the first hit per normalized
+URL is canonical and every contributing provider/query is kept.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
 import httpx
+import structlog
 
 from research_agent.config import Settings
 from research_agent.core.errors import (
@@ -34,8 +48,16 @@ from research_agent.core.errors import (
     NoSearchProviderConfiguredError,
     ProviderError,
     ProviderRateLimitedError,
+    ProviderTimeoutError,
 )
-from research_agent.core.models import SearchOptions, SearchResult
+from research_agent.core.models import (
+    DedupedSearchResult,
+    ProviderExecutionStatus,
+    ProviderRunStatus,
+    SearchOptions,
+    SearchResponse,
+    SearchResult,
+)
 from research_agent.logging import get_logger
 from research_agent.providers.search.base import SearchProvider
 from research_agent.providers.search.registry import build_search_providers
@@ -46,6 +68,12 @@ Sleep = Callable[[float], Awaitable[None]]
 MAX_BACKOFF_S = 30.0
 
 AttemptStatus = Literal["OK", "EMPTY", "FAILED", "SKIPPED_CIRCUIT_OPEN"]
+Strategy = Literal["fallback", "fanout"]
+
+
+def query_hash(query: str) -> str:
+    """Stable, non-reversible identifier for logging a query without its text."""
+    return hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -65,6 +93,12 @@ class SearchRun:
     hits: list[SearchResult] = field(default_factory=list)
     """Every normalized hit, including duplicates (full provenance)."""
     attempts: list[SearchAttempt] = field(default_factory=list)
+    request_id: str = ""
+    strategy: Strategy = "fallback"
+    queries: list[str] = field(default_factory=list)
+    """Cleaned queries in execution order."""
+    providers: list[str] = field(default_factory=list)
+    """Provider names in priority order."""
 
     @property
     def results(self) -> list[SearchResult]:
@@ -85,6 +119,84 @@ class SearchRun:
     def errors(self) -> list[dict[str, object]]:
         return [a.error for a in self.attempts if a.error is not None]
 
+    def _order_key(self, index: int, hit: SearchResult) -> tuple[int, int, int, int]:
+        q = self.queries.index(hit.query) if hit.query in self.queries else len(self.queries)
+        p = (
+            self.providers.index(hit.source)
+            if hit.source in self.providers
+            else len(self.providers)
+        )
+        return (q, p, hit.rank, index)
+
+    def to_response(self) -> SearchResponse:
+        ordered = [
+            hit
+            for _, hit in sorted(
+                enumerate(self.hits), key=lambda pair: self._order_key(pair[0], pair[1])
+            )
+        ]
+        groups: dict[str, list[SearchResult]] = {}
+        for hit in ordered:
+            groups.setdefault(hit.url, []).append(hit)
+        results = [
+            DedupedSearchResult(
+                result=group[0],
+                providers=_unique([h.source for h in group]),
+                queries=_unique([h.query for h in group]),
+                occurrences=len(group),
+            )
+            for group in groups.values()
+        ]
+        return SearchResponse(
+            request_id=self.request_id,
+            strategy=self.strategy,
+            queries=list(self.queries),
+            results=results,
+            provider_statuses=[self._provider_status(name) for name in self.providers],
+            total_hits=len(self.hits),
+            duplicate_count=len(self.hits) - len(results),
+        )
+
+    def _provider_status(self, provider: str) -> ProviderExecutionStatus:
+        attempts = [a for a in self.attempts if a.provider == provider]
+        skipped = sum(1 for a in attempts if a.status == "SKIPPED_CIRCUIT_OPEN")
+        succeeded = sum(1 for a in attempts if a.status == "OK")
+        empty = sum(1 for a in attempts if a.status == "EMPTY")
+        failed = sum(1 for a in attempts if a.status == "FAILED")
+        calls = succeeded + empty + failed
+        status: ProviderRunStatus
+        if not attempts:
+            status = "NOT_CALLED"
+        elif calls == 0:
+            status = "SKIPPED"
+        elif failed == calls:
+            status = "FAILED"
+        elif failed:
+            status = "PARTIAL"
+        elif succeeded:
+            status = "SUCCESS"
+        else:
+            status = "EMPTY"
+        categories = sorted(
+            {str(a.error.get("category")) for a in attempts if a.error and a.error.get("category")}
+        )
+        return ProviderExecutionStatus(
+            provider=provider,
+            status=status,
+            calls=calls,
+            succeeded=succeeded,
+            empty=empty,
+            failed=failed,
+            skipped=skipped,
+            result_count=sum(a.result_count for a in attempts),
+            duration_ms=sum(a.duration_ms for a in attempts),
+            error_categories=categories,
+        )
+
+
+def _unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
 
 class _CircuitBreaker:
     def __init__(self, threshold: int) -> None:
@@ -103,7 +215,7 @@ class SearchService:
         self,
         providers: Sequence[SearchProvider],
         *,
-        strategy: Literal["fallback", "fanout"] = "fallback",
+        strategy: Strategy = "fallback",
         max_retries: int = 1,
         concurrency: int = 4,
         circuit_breaker_threshold: int = 3,
@@ -127,7 +239,20 @@ class SearchService:
     def provider_names(self) -> list[str]:
         return [p.name for p in self._providers]
 
-    async def search(self, queries: Sequence[str], options: SearchOptions) -> SearchRun:
+    async def search(
+        self,
+        queries: Sequence[str],
+        options: SearchOptions,
+        *,
+        request_id: str | None = None,
+    ) -> SearchRun:
+        request_id = request_id or uuid.uuid4().hex
+        with structlog.contextvars.bound_contextvars(request_id=request_id):
+            return await self._search(queries, options, request_id)
+
+    async def _search(
+        self, queries: Sequence[str], options: SearchOptions, request_id: str
+    ) -> SearchRun:
         cleaned: list[str] = []
         for q in queries:
             q = " ".join(q.split())
@@ -147,7 +272,12 @@ class SearchService:
 
         per_query = await asyncio.gather(*(run_query(q) for q in cleaned))
 
-        run = SearchRun()
+        run = SearchRun(
+            request_id=request_id,
+            strategy=self._strategy,
+            queries=cleaned,
+            providers=self.provider_names,
+        )
         for hits, attempts in per_query:  # preserves query order → deterministic dedup
             run.hits.extend(hits)
             run.attempts.extend(attempts)
@@ -196,7 +326,7 @@ class SearchService:
         breaker: _CircuitBreaker,
     ) -> tuple[list[SearchResult], SearchAttempt]:
         if breaker.is_open(provider.name):
-            log.warning("search.circuit_open", provider=provider.name, query=query)
+            log.warning("search.circuit_open", provider=provider.name, query_hash=query_hash(query))
             return [], SearchAttempt(provider.name, query, "SKIPPED_CIRCUIT_OPEN", 0, 0, 0)
 
         started = time.monotonic()
@@ -204,15 +334,16 @@ class SearchService:
         while True:
             tries += 1
             try:
-                hits = await provider.search(query, options)
+                hits = await self._bounded_search(provider, query, options)
             except ProviderError as exc:
                 if exc.retryable and tries <= self._max_retries:
                     delay = self._backoff(tries, exc)
                     log.warning(
                         "search.retry",
                         provider=provider.name,
-                        query=query,
+                        query_hash=query_hash(query),
                         error_code=exc.code,
+                        error_category=exc.category,
                         attempt=tries,
                         delay_s=delay,
                     )
@@ -223,7 +354,7 @@ class SearchService:
                 log.warning(
                     "search.provider_failed",
                     provider=provider.name,
-                    query=query,
+                    query_hash=query_hash(query),
                     duration_ms=duration_ms,
                     error=exc.to_dict(),
                 )
@@ -236,13 +367,26 @@ class SearchService:
             log.info(
                 "search.provider_call",
                 provider=provider.name,
-                query=query,
+                query_hash=query_hash(query),
+                query_len=len(query),
                 status=status,
                 results=len(hits),
                 duration_ms=duration_ms,
                 tries=tries,
             )
             return hits, SearchAttempt(provider.name, query, status, len(hits), duration_ms, tries)
+
+    @staticmethod
+    async def _bounded_search(
+        provider: SearchProvider, query: str, options: SearchOptions
+    ) -> list[SearchResult]:
+        try:
+            async with asyncio.timeout(options.timeout_s):
+                return await provider.search(query, options)
+        except TimeoutError:
+            raise ProviderTimeoutError(
+                provider.name, f"service-level timeout after {options.timeout_s}s"
+            ) from None
 
     def _backoff(self, tries: int, exc: ProviderError) -> float:
         if isinstance(exc, ProviderRateLimitedError) and exc.retry_after_s is not None:
@@ -256,6 +400,7 @@ def build_search_service(settings: Settings, client: httpx.AsyncClient) -> Searc
     Raises ``NoSearchProviderConfiguredError`` (code ``REQUIRES_CONFIGURATION``) when no
     provider in ``SEARCH_PROVIDERS`` has its credentials set.
     """
+    log.info("search.configuration", **settings.safe_summary())
     return SearchService(
         build_search_providers(settings, client),
         strategy=settings.search_strategy,

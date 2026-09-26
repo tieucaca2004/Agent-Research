@@ -34,6 +34,31 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: Literal["json", "console"] = "json"
 
+    def safe_summary(self) -> dict[str, object]:
+        """Configuration suitable for logging: secrets reported only as CONFIGURED/MISSING.
+
+        Credentials are a list of ``{"name", "status"}`` records so that the log redaction
+        filter (which masks values under secret-looking keys) does not hide the status.
+        """
+        credentials = [
+            ("PERPLEXITY_API_KEY", self.perplexity_api_key),
+            ("GOOGLE_API_KEY", self.google_api_key),
+            ("GOOGLE_CSE_ID", self.google_cse_id),
+        ]
+        return {
+            "search_providers": list(self.search_providers),
+            "search_strategy": self.search_strategy,
+            "search_timeout_s": self.search_timeout_s,
+            "search_max_results": self.search_max_results,
+            "search_max_retries": self.search_max_retries,
+            "search_concurrency": self.search_concurrency,
+            "search_circuit_breaker_threshold": self.search_circuit_breaker_threshold,
+            "credentials": [
+                {"name": name, "status": "CONFIGURED" if value is not None else "MISSING"}
+                for name, value in credentials
+            ],
+        }
+
     @field_validator("search_providers", mode="before")
     @classmethod
     def _split_providers(cls, value: object) -> object:

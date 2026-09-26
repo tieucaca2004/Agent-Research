@@ -132,3 +132,36 @@ async def test_everything_down_fails_clearly_and_logs_no_secrets(
 
 async def _no_sleep(_: float) -> None:
     return None
+
+
+@respx.mock
+async def test_response_statuses_with_real_adapters(http_client: httpx.AsyncClient) -> None:
+    """Fanout: Perplexity 200 + Google timeout → results kept, Google reported TIMEOUT.
+    Fallback default: Perplexity 502 → Google used, Perplexity reported PROVIDER_ERROR."""
+    respx.post(PPLX).mock(return_value=httpx.Response(200, json=pplx_body("https://p.example/")))
+    respx.get(GOOGLE).mock(side_effect=httpx.ReadTimeout("slow"))
+    settings = both_configured(search_strategy="fanout", search_max_retries=0)
+    response = (
+        await build_search_service(settings, http_client).search(
+            ["q"], default_search_options(settings), request_id="it-1"
+        )
+    ).to_response()
+    by_name = {s.provider: s for s in response.provider_statuses}
+    assert response.request_id == "it-1"
+    assert [r.result.url for r in response.results] == ["https://p.example/"]
+    assert (by_name["perplexity"].status, by_name["google"].status) == ("SUCCESS", "FAILED")
+    assert by_name["google"].error_categories == ["TIMEOUT"]
+
+    respx.post(PPLX).mock(return_value=httpx.Response(502))
+    respx.get(GOOGLE).mock(return_value=httpx.Response(200, json=google_body("https://g.example/")))
+    settings = both_configured(search_max_retries=0)
+    response = (
+        await build_search_service(settings, http_client).search(
+            ["q"], default_search_options(settings)
+        )
+    ).to_response()
+    by_name = {s.provider: s for s in response.provider_statuses}
+    assert response.strategy == "fallback"
+    assert by_name["perplexity"].error_categories == ["PROVIDER_ERROR"]
+    assert by_name["google"].status == "SUCCESS"
+    assert [r.result.source for r in response.results] == ["google"]

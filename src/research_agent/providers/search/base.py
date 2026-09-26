@@ -17,9 +17,11 @@ import httpx
 from research_agent.config import Settings
 from research_agent.core.errors import (
     ProviderAuthError,
+    ProviderNetworkError,
     ProviderRateLimitedError,
     ProviderRequestError,
     ProviderResponseError,
+    ProviderTimeoutError,
     ProviderUnavailableError,
 )
 from research_agent.core.models import SearchOptions, SearchResult
@@ -66,9 +68,9 @@ async def send_json_request(
     try:
         response = await client.send(request, auth=None, follow_redirects=False)
     except httpx.TimeoutException:
-        raise ProviderUnavailableError(provider, f"timeout after {timeout_s}s") from None
+        raise ProviderTimeoutError(provider, f"timeout after {timeout_s}s") from None
     except httpx.TransportError as exc:
-        raise ProviderUnavailableError(provider, f"transport error: {type(exc).__name__}") from None
+        raise ProviderNetworkError(provider, f"transport error: {type(exc).__name__}") from None
 
     status = response.status_code
     if status in (401, 403):

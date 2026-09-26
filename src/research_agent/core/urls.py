@@ -4,6 +4,9 @@ Normalized form:
 - scheme and host lower-cased; host IDNA-encoded; only http/https accepted
 - userinfo (``user:pass@``) dropped — credentials never propagate
 - default ports (80/443) removed
+- path percent-encoding normalized (RFC 3986 §6.2.2): hex digits upper-cased, encoded
+  unreserved characters decoded, non-ASCII/space UTF-8 percent-encoded; encoded reserved
+  characters such as ``%2F`` stay encoded (decoding them would change the resource)
 - empty path becomes ``/``; dot segments resolved
 - fragment removed
 - tracking query parameters removed; remaining parameters sorted (stable)
@@ -12,7 +15,8 @@ Normalized form:
 from __future__ import annotations
 
 import posixpath
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+import string
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from research_agent.core.errors import InvalidURLError
 
@@ -40,6 +44,11 @@ TRACKING_PREFIXES = ("utm_",)
 
 MAX_URL_LENGTH = 2048
 
+_HEX = frozenset(string.hexdigits)
+_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
+# Characters allowed literally in a path: unreserved + sub-delims + ":" "@" "/".
+_PATH_LITERAL = _UNRESERVED | frozenset("!$&'()*+,;=:@/")
+
 
 def _is_tracking(name: str) -> bool:
     lowered = name.lower()
@@ -58,9 +67,25 @@ def _normalize_host(host: str) -> str:
         raise InvalidURLError(f"Invalid host: {host!r}") from exc
 
 
+def _normalize_path_encoding(path: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(path):
+        ch = path[i]
+        if ch == "%" and i + 2 < len(path) and path[i + 1] in _HEX and path[i + 2] in _HEX:
+            decoded = chr(int(path[i + 1 : i + 3], 16))
+            out.append(decoded if decoded in _UNRESERVED else "%" + path[i + 1 : i + 3].upper())
+            i += 3
+            continue
+        out.append(ch if ch in _PATH_LITERAL else quote(ch, safe=""))
+        i += 1
+    return "".join(out)
+
+
 def _normalize_path(path: str) -> str:
     if not path:
         return "/"
+    path = _normalize_path_encoding(path)
     trailing = path.endswith("/")
     normalized = posixpath.normpath(path)
     if normalized.startswith("//"):  # posixpath keeps a leading '//' pair

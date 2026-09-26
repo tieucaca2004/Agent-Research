@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -38,3 +39,58 @@ class SearchResult(BaseModel):
     query: str
     """The query string that produced the hit (provenance)."""
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+ProviderRunStatus = Literal["SUCCESS", "EMPTY", "PARTIAL", "FAILED", "SKIPPED", "NOT_CALLED"]
+"""Aggregated outcome of one provider across all queries of a run.
+
+SUCCESS    no call failed and at least one call returned results
+EMPTY      no call failed and no call returned results
+PARTIAL    some calls failed and some succeeded
+FAILED     every executed call failed (see ``error_categories``)
+SKIPPED    every planned call was skipped by the circuit breaker
+NOT_CALLED never needed (e.g. fallback provider while the primary succeeded)
+Calls skipped by the circuit breaker are counted in ``skipped`` only.
+"""
+
+
+class ProviderExecutionStatus(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: str
+    status: ProviderRunStatus
+    calls: int = Field(ge=0)
+    succeeded: int = Field(ge=0)
+    empty: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    skipped: int = Field(ge=0)
+    result_count: int = Field(ge=0)
+    duration_ms: int = Field(ge=0)
+    error_categories: list[str] = Field(default_factory=list)
+    """Sorted, unique error categories (e.g. ``TIMEOUT``, ``AUTHENTICATION_ERROR``)."""
+
+
+class DedupedSearchResult(BaseModel):
+    """One unique normalized URL with the provenance of every hit that produced it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    result: SearchResult
+    """Canonical hit: lowest (query order, provider priority, provider rank)."""
+    providers: list[str]
+    """Providers that returned this URL, in provider-priority order."""
+    queries: list[str]
+    """Queries that returned this URL, in query order."""
+    occurrences: int = Field(ge=1)
+
+
+class SearchResponse(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request_id: str
+    strategy: Literal["fallback", "fanout"]
+    queries: list[str]
+    results: list[DedupedSearchResult]
+    provider_statuses: list[ProviderExecutionStatus]
+    total_hits: int = Field(ge=0)
+    duplicate_count: int = Field(ge=0)

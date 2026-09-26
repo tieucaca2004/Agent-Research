@@ -202,6 +202,13 @@ Details and sources: [docs/providers.md](docs/providers.md).
 
 Retryable errors (timeout, transport, 5xx, 429) are retried `SEARCH_MAX_RETRIES` times with exponential backoff (`Retry-After` honoured, capped at 30 s); a per-run circuit breaker skips a provider after `SEARCH_CIRCUIT_BREAKER_THRESHOLD` consecutive failures. Every provider call is recorded as a `SearchAttempt` (provider, query, status, count, duration, tries, error). A provider failing does not fail the job unless **every** attempt failed (→ `AllSearchProvidersFailedError`, job `FAILED` with `error.step = SEARCHING`). Results are deduplicated by normalized URL; all raw hits are kept for provenance. Unconfigured providers are skipped with a warning; if none is configured, construction fails with `REQUIRES_CONFIGURATION` naming the missing variables. Adding a provider = new adapter + registry entry; `SearchService` is unchanged.
 
+Sprint 01 delta (response & observability):
+- `SearchRun.to_response()` → `SearchResponse {request_id, strategy, queries, results[], provider_statuses[], total_hits, duplicate_count}`. Each result is a `DedupedSearchResult` (canonical hit + every provider/query that returned the URL). Ordering is deterministic: (query order, provider priority, provider rank); independent of completion order.
+- `ProviderExecutionStatus` per provider: `SUCCESS | EMPTY | PARTIAL | FAILED | SKIPPED | NOT_CALLED` + counts + `error_categories`.
+- Error `category` (codes unchanged for backward compatibility): `CONFIGURATION_ERROR, AUTHENTICATION_ERROR, RATE_LIMITED, TIMEOUT, NETWORK_ERROR, PROVIDER_ERROR, INVALID_RESPONSE`.
+- Every provider try is bounded at service level by `options.timeout_s` (wall clock) in addition to the HTTP client timeout.
+- Logs carry `request_id`; queries appear only as `query_hash` (SHA-256, 16 hex) + length. Configuration is logged via `Settings.safe_summary()` (credentials as `CONFIGURED`/`MISSING`).
+
 Test doubles (e.g. `ScriptedSearchProvider`, later `FakeAIProvider`) live **only under `tests/`** and are never registered by production config.
 
 ---

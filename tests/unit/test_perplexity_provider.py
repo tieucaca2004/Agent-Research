@@ -161,3 +161,94 @@ async def test_transport_failures_are_retryable(
     assert info.value.retryable
     assert FAKE_PPLX_KEY not in str(info.value)
     assert info.value.__cause__ is None  # original exception (may hold request) not chained
+
+
+# --- Sprint 01 delta: 502, error categories, Authorization header safety --------------
+
+
+@pytest.mark.parametrize(
+    ("response", "category", "retryable"),
+    [
+        (httpx.Response(400), "PROVIDER_ERROR", False),
+        (httpx.Response(401), "AUTHENTICATION_ERROR", False),
+        (httpx.Response(403), "AUTHENTICATION_ERROR", False),
+        (httpx.Response(429), "RATE_LIMITED", True),
+        (httpx.Response(500), "PROVIDER_ERROR", True),
+        (httpx.Response(502), "PROVIDER_ERROR", True),
+        (httpx.Response(200, text="{not json"), "INVALID_RESPONSE", False),
+        (httpx.Response(200, json={"unexpected": True}), "INVALID_RESPONSE", False),
+    ],
+)
+@respx.mock
+async def test_status_to_category(
+    provider: PerplexitySearchProvider, response: httpx.Response, category: str, retryable: bool
+) -> None:
+    respx.post(ENDPOINT).mock(return_value=response)
+    with pytest.raises(ProviderError) as info:
+        await provider.search("q", SearchOptions())
+    assert info.value.category == category
+    assert info.value.retryable is retryable
+
+
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [(httpx.ReadTimeout("t"), "TIMEOUT"), (httpx.ConnectError("reset"), "NETWORK_ERROR")],
+)
+@respx.mock
+async def test_transport_categories(
+    provider: PerplexitySearchProvider, exc: Exception, category: str
+) -> None:
+    respx.post(ENDPOINT).mock(side_effect=exc)
+    with pytest.raises(ProviderUnavailableError) as info:
+        await provider.search("q", SearchOptions())
+    assert info.value.category == category
+
+
+@respx.mock
+async def test_redirect_not_followed_so_auth_header_never_leaves_provider_host(
+    provider: PerplexitySearchProvider,
+) -> None:
+    respx.post(ENDPOINT).mock(
+        return_value=httpx.Response(307, headers={"location": "https://attacker.example/steal"})
+    )
+    attacker = respx.route(host="attacker.example")
+    with pytest.raises(ProviderResponseError):
+        await provider.search("q", SearchOptions())
+    assert attacker.call_count == 0
+    assert respx.calls.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json=OK_BODY),
+        httpx.Response(401, json={"error": f"invalid key Bearer {FAKE_PPLX_KEY}"}),
+        httpx.Response(500, text=f"echo Authorization: Bearer {FAKE_PPLX_KEY}"),
+    ],
+)
+@respx.mock
+async def test_authorization_header_never_logged(
+    provider: PerplexitySearchProvider,
+    response: httpx.Response,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import structlog
+
+    from research_agent.logging import configure_logging
+    from research_agent.pipeline.search import SearchService
+
+    respx.post(ENDPOINT).mock(return_value=response)
+    configure_logging("DEBUG", "json")
+    try:
+        svc = SearchService([provider], max_retries=0)
+        try:
+            run = await svc.search(["q"], SearchOptions())
+            run.to_response()
+        except Exception as exc:
+            assert FAKE_PPLX_KEY not in str(exc)
+        output = capsys.readouterr()
+    finally:
+        structlog.reset_defaults()
+    assert FAKE_PPLX_KEY not in output.out
+    assert FAKE_PPLX_KEY not in output.err
+    assert "authorization" not in output.out.lower()
