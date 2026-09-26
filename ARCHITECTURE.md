@@ -165,8 +165,9 @@ class AIProvider(Protocol):
 ### 4.2 SearchProvider
 
 ```python
-class SearchProvider(Protocol):
+class SearchProvider(ABC):   # implemented: providers/search/base.py
     name: str
+    required_settings: tuple[str, ...]
     async def search(self, query: str, options: SearchOptions) -> list[SearchResult]: ...
 
 class SearchOptions(BaseModel):
@@ -178,22 +179,30 @@ class SearchOptions(BaseModel):
 class SearchResult(BaseModel):
     title: str
     url: str                 # normalized
+    original_url: str        # as returned by provider (provenance)
     snippet: str | None
     source: str              # provider name
     published_at: datetime | None = None
     rank: int
-    raw_query: str
+    query: str               # query that produced the hit (provenance)
+    metadata: dict[str, str]
 ```
 
 | Provider | Status at design time |
 |---|---|
-| Perplexity (Search API) | **UNVERIFIED** — endpoint and response shape must be confirmed against current docs + a live call. **REQUIRES CONFIGURATION** (`PERPLEXITY_API_KEY`). |
-| Google (Programmable Search / Custom Search JSON API) | **UNVERIFIED**. **REQUIRES CONFIGURATION** (`GOOGLE_API_KEY`, `GOOGLE_CSE_ID`). |
-| Bing Web Search API | **UNVERIFIED / likely unavailable** — Microsoft announced retirement of the Bing Search APIs (Aug 2025). Interface slot kept; implementation deferred until a working endpoint is confirmed. |
+| Perplexity (Search API) — **primary** | Contract **VERIFIED from official SDK** (`perplexityai` 0.43.6): `POST https://api.perplexity.ai/search`, Bearer auth. Live: **REQUIRES CONFIGURATION** (`PERPLEXITY_API_KEY`). |
+| Google (Custom Search JSON API) — **fallback** | Contract **VERIFIED from official discovery doc** (`google-api-python-client` 2.200.0). Live: **REQUIRES CONFIGURATION** (`GOOGLE_API_KEY`, `GOOGLE_CSE_ID`). ⚠ Closed to new customers; discontinued **2027-01-01** → a replacement fallback is needed. |
+| Bing Web Search API | Not implemented — Microsoft retired the Bing Search APIs (Aug 2025). |
 
-`SearchService` fans out queries to configured providers with per-provider timeout, 1 retry on 5xx/timeout, and circuit-break on repeated failure. A provider failing does not fail the job unless **all** providers fail (→ `FAILED` with `error.step = SEARCHING`).
+Details and sources: [docs/providers.md](docs/providers.md).
 
-Test doubles (`FakeSearchProvider`, `FakeAIProvider`) live **only under `tests/`** and are never registered by production config.
+`SearchService` (Sprint 01 decision, per product owner: Perplexity primary, Google fallback) supports two strategies via `SEARCH_STRATEGY`:
+- `fallback` (default): per query, providers are tried in `SEARCH_PROVIDERS` order; the next is used only if the previous failed or returned zero results.
+- `fanout`: all providers queried, results merged.
+
+Retryable errors (timeout, transport, 5xx, 429) are retried `SEARCH_MAX_RETRIES` times with exponential backoff (`Retry-After` honoured, capped at 30 s); a per-run circuit breaker skips a provider after `SEARCH_CIRCUIT_BREAKER_THRESHOLD` consecutive failures. Every provider call is recorded as a `SearchAttempt` (provider, query, status, count, duration, tries, error). A provider failing does not fail the job unless **every** attempt failed (→ `AllSearchProvidersFailedError`, job `FAILED` with `error.step = SEARCHING`). Results are deduplicated by normalized URL; all raw hits are kept for provenance. Unconfigured providers are skipped with a warning; if none is configured, construction fails with `REQUIRES_CONFIGURATION` naming the missing variables. Adding a provider = new adapter + registry entry; `SearchService` is unchanged.
+
+Test doubles (e.g. `ScriptedSearchProvider`, later `FakeAIProvider`) live **only under `tests/`** and are never registered by production config.
 
 ---
 
