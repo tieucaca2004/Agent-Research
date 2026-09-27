@@ -413,9 +413,15 @@ Migrations via Alembic only; no `create_all` in production paths.
 ```text
 QUEUED → PLANNING → SEARCHING → CRAWLING → EXTRACTING → NORMALIZING → VERIFYING → COMPLETED
    any non-terminal ──cancel──▶ CANCELLED
-   any stage ──fatal──▶ FAILED        (error = {step, code, message, retryable})
-   VERIFYING → PARTIAL                 (some sources/extractions failed but ≥1 verified result)
+   any stage ──fatal──▶ FAILED        (error = {step, code, category, message, retryable})
+   last configured stage → PARTIAL     (≥1 useful result but some work failed or was cut off)
 ```
+
+Sprint 02 update: each job declares its configured `stages` (ordered subset of the list above).
+Transitions go only to the next configured stage or to a terminal state; `PARTIAL` is the outcome
+of the *last configured* stage (Sprint 02 jobs: `PLANNING → SEARCHING → terminal`, so `PARTIAL`
+follows `SEARCHING`). Full lifecycle, timeout layering and result rules:
+[docs/sprint-02-research-job.md](docs/sprint-02-research-job.md).
 
 - Transitions enforced by `status.py` (illegal transition = bug, raises).
 - `progress = {step, step_index, total_steps, counts:{queries, urls, fetched, skipped, failed, documents, extractions, entities, verified}}` updated at every step.
@@ -522,7 +528,7 @@ STALE_AFTER_DAYS=365, RATE_LIMIT_RESEARCH_PER_MIN=5, LOG_LEVEL
 | Sprint | Scope | Exit criteria (evidence required) |
 |---|---|---|
 | 01 Core Search | project scaffold, config, logging, `SearchProvider` + `SearchResult`, Perplexity & Google providers, URL normalizer, `SearchService` fan-out/dedup/retry | unit + mocked-HTTP tests pass; live test PASS or REQUIRES CONFIGURATION |
-| 02 Research Job | job model, status machine, supervisor skeleton, worker, `job_events`, API `POST/GET/status/cancel`, planner via AIProvider | status transitions + cancel + API tests |
+| 02 Research Job | job model, state machine with per-job stages, in-memory repository + events, in-process `JobRunner` (per-query search orchestration, stage timeout, job deadline, cancellation), fixed planner (`queries = [query]`) | lifecycle/state-machine/runner tests; Sprint 01 suite unchanged. *Moved out (decision D1): HTTP API, worker, LLM planner via AIProvider, lease recovery.* |
 | 03 Crawler | bounded queue, robots, SSRF guard, rate limit, retry, cache, parser | fixture + respx tests, failure tests |
 | 04 Extraction | AIProvider impls (OpenAI, Anthropic), structured extraction, evidence check, JSON-LD path | malformed/timeout tests; live structured-output check |
 | 05 Normalization + Dedup | normalizers, entity resolution, thresholds | table-driven tests incl. VN formats |

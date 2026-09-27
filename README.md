@@ -3,7 +3,8 @@
 Natural-language query → research plan → web search → crawl → extraction → normalization →
 dedup → verification → provenance → results. Design: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Current state: **Sprint 01 — Core Search** (search provider abstraction, Perplexity + Google
+Current state: **Sprint 02 — Research Job** (job lifecycle in `src/research_agent/jobs/`, see
+[docs/sprint-02-research-job.md](docs/sprint-02-research-job.md)) on top of **Sprint 01 — Core Search** (search provider abstraction, Perplexity + Google
 CSE adapters, URL normalization, `SearchService`). Provider contracts: [docs/providers.md](docs/providers.md).
 
 ## Development

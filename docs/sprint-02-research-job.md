@@ -1,7 +1,8 @@
 # Sprint 02 — Research Job lifecycle (architecture proposal)
 
-Status: **PROPOSED — awaiting confirmation of §10 decisions before any implementation.**
-Baseline: Sprint 01 frozen at `cdd1234`. Nothing in this document changes Sprint 01 code.
+Status: **IMPLEMENTED** (design commit `c9bd503`; decisions D1–D5 confirmed, see §10 and §12).
+Baseline: Sprint 01 frozen at `cdd1234`. Sprint 02 does not modify any Sprint 01 file.
+Code: `src/research_agent/jobs/` (`models`, `state_machine`, `repository`, `planner`, `runner`, `errors`).
 
 ```text
 ResearchJob ──▶ ResearchPlan ──▶ Search execution ──▶ (future) Crawl ──▶ (future) Extract
@@ -112,15 +113,21 @@ duration_ms, error{code, category}], errors[]}` (JSON, no exceptions, no secrets
 
 ### Final status after the last stage (Sprint 02: SEARCHING), deterministic
 
-A query is **covered** if at least one provider attempt for it ended `OK` or `EMPTY`.
+A query outcome is `COVERED` (≥1 provider attempt ended `OK`/`EMPTY`), `FAILED`
+(`AllSearchProvidersFailedError`), `INTERRUPTED` (running when cancel/timeout hit) or `NOT_RUN`.
+`JobResult.coverage` = `COMPLETE` (all covered) / `PARTIAL` (some) / `NONE`.
 
-| Condition (evaluated in this order) | Job status |
-|---|---|
-| cancellation observed | `CANCELLED` |
-| job deadline / search-stage timeout hit | `FAILED` (`JOB_DEADLINE_EXCEEDED` / `SEARCH_STAGE_TIMEOUT`) — completed query results are still stored |
-| no query covered | `FAILED` (`ALL_SEARCH_PROVIDERS_FAILED`) |
-| some but not all queries covered | `PARTIAL` |
-| all queries covered (even with 0 results, even if a fallback was needed) | `COMPLETED` (provider failures kept as warnings) |
+| Condition (evaluated in this order) | Job status | Recorded as |
+|---|---|---|
+| cancellation requested | `CANCELLED` | status only (`error = None`); captured results kept, `coverage` shows what was obtained |
+| job deadline or stage timeout hit, ≥1 query covered | `PARTIAL` | warning `JOB_DEADLINE_EXCEEDED` / `SEARCH_STAGE_TIMEOUT` (category `TIMEOUT`) |
+| job deadline or stage timeout hit, nothing covered | `FAILED` | error `JOB_DEADLINE_EXCEEDED` / `SEARCH_STAGE_TIMEOUT` |
+| no query covered | `FAILED` | error `ALL_SEARCH_PROVIDERS_FAILED` + `provider_errors[provider, code, category]` |
+| some but not all queries covered | `PARTIAL` | warning `PROVIDER_FAILURES` |
+| all queries covered (even with 0 results, even via fallback) | `COMPLETED` | warning `PROVIDER_FAILURES` if any provider call failed |
+
+The job deadline is the tighter of the two time limits when `deadline − now ≤ stage timeout`,
+in which case it is reported as `JOB_DEADLINE_EXCEEDED`; otherwise `SEARCH_STAGE_TIMEOUT`.
 
 ## 6. Progress
 
@@ -135,15 +142,20 @@ exception text from providers.
 
 | Code | Category | When |
 |---|---|---|
-| `REQUIRES_CONFIGURATION` | `CONFIGURATION_ERROR` | no search provider configured (Sprint 01 error) |
-| `ALL_SEARCH_PROVIDERS_FAILED` | `PROVIDER_ERROR` | no planned query covered |
-| `SEARCH_STAGE_TIMEOUT` | `TIMEOUT` | SEARCHING exceeded `JOB_SEARCH_TIMEOUT_S` |
-| `JOB_DEADLINE_EXCEEDED` | `TIMEOUT` | job exceeded `JOB_TIMEOUT_S` |
-| `WORKER_LOST` | `INTERNAL_ERROR` | lease expired without progress (recovery) |
-| `INTERNAL_ERROR` | `INTERNAL_ERROR` | unexpected exception (type name only, message sanitized) |
+| `ALL_SEARCH_PROVIDERS_FAILED` | `PROVIDER_ERROR` | no planned query covered (provider errors preserved) |
+| `PROVIDER_FAILURES` | `PROVIDER_ERROR` | warning: some provider calls failed but the job produced results |
+| `SEARCH_STAGE_TIMEOUT` | `TIMEOUT` | SEARCHING exceeded `search_stage_timeout_s` |
+| `JOB_DEADLINE_EXCEEDED` | `TIMEOUT` | job exceeded `job_timeout_s` |
+| `RUNNER_INTERRUPTED` | `INTERNAL_ERROR` | the runner's own task was cancelled (recorded, then re-raised) |
+| `INTERNAL_ERROR` | `INTERNAL_ERROR` | unexpected exception (type name only, message never copied) |
+| `WORKER_LOST` | `INTERNAL_ERROR` | *designed only* — lease-expiry recovery is deferred (D5) |
 
-`CANCELLED` is a status, not an error. Invalid transitions and idempotency conflicts are raised to
-the caller, not stored as job failures.
+Every provider error keeps Sprint 01 `provider`, `code`, `category` (`ProviderErrorRecord`); no new
+provider taxonomy. `CANCELLED` is a status, not an error. Configuration errors
+(`REQUIRES_CONFIGURATION`) surface when the `SearchService` is built, before any job runs.
+Invalid transitions, version conflicts, idempotency conflicts and double execution raise to the
+caller (`InvalidJobTransitionError`, `JobVersionConflictError`, `IdempotencyConflictError`,
+`JobNotClaimableError`) and are never stored as job failures.
 
 ## 8. Timeouts, retry, cancellation, process failure — one mechanism per layer
 
@@ -152,11 +164,11 @@ the caller, not stored as job failures.
 | Provider HTTP operation | httpx timeout | `SEARCH_TIMEOUT_S` (15) | Sprint 01 adapter | `ProviderTimeoutError` (retryable) |
 | Provider try (wall clock) | `asyncio.timeout` per try | `SEARCH_TIMEOUT_S` (15) | Sprint 01 service | `ProviderTimeoutError` → retry / fallback |
 | Provider retry | backoff inside `SearchService` | `SEARCH_MAX_RETRIES` (1) | Sprint 01 service | transient errors only |
-| Search stage | `asyncio.timeout` around the whole SEARCHING stage | **new** `JOB_SEARCH_TIMEOUT_S` (300) | Sprint 02 runner | `FAILED/SEARCH_STAGE_TIMEOUT`, partial per-query results kept |
-| Job deadline | absolute `deadline_at = started_at + JOB_TIMEOUT_S` | `JOB_TIMEOUT_S` (600, ARCHITECTURE §13) | Sprint 02 runner | `FAILED/JOB_DEADLINE_EXCEEDED`; each stage runs under `min(stage timeout, deadline − now)` |
+| Search stage | `asyncio.timeout` around the whole SEARCHING stage | `JobRunner(search_stage_timeout_s=300)` | Sprint 02 runner | `PARTIAL` (results kept) or `FAILED`, code `SEARCH_STAGE_TIMEOUT` |
+| Job deadline | absolute `deadline_at = started_at + job_timeout_s`, re-checked at stage boundaries | `JobRunner(job_timeout_s=600)` | Sprint 02 runner | `PARTIAL` or `FAILED`, code `JOB_DEADLINE_EXCEEDED`; the stage runs under `min(stage timeout, deadline − now)` |
 | Job retry | **none automatic** in V1 | — | caller | re-run = new job (`retry_of` link); terminal jobs never restart |
 | Cancellation | `cancel_requested` flag + cancel the in-flight asyncio task | — | Sprint 02 runner | `CANCELLED` |
-| Process failure | lease + heartbeat, recovery sweep | new `JOB_LEASE_S` (60) | Sprint 02 repository | `FAILED/WORKER_LOST` |
+| Process failure | lease + heartbeat, recovery sweep | `JOB_LEASE_S` | **deferred (D5)** | designed only; not implemented, not verified |
 
 Why retries cannot overrun the deadline: the stage/deadline scope is an outer `asyncio.timeout`.
 Probes P2/P3/Race show it interrupts in-flight provider calls and backoff sleeps, and is never
@@ -172,10 +184,11 @@ Precedence when several happen together: cancel > job deadline > stage timeout >
 and between queries → `CANCELLED`. Terminal → no-op returning current status (idempotent).
 Already-finished query outcomes are kept on a cancelled job.
 
-**Persistence boundary.** `JobRepository` protocol (async): `create`, `get`,
-`get_by_idempotency_key`, `claim` (compare-and-set `QUEUED → PLANNING`, sets lease),
-`transition` (optimistic `version` check), `heartbeat`, `save_plan`, `save_search_outcome`,
-`append_event`, `list_events`, `find_expired_leases`. Sprint 02 ships `InMemoryJobRepository`
+**Persistence boundary.** `JobRepository` protocol (async, implemented): `create`
+(idempotent), `get`, `save` (optimistic `version` check + state-machine validation +
+`job.state_changed` event), `claim` (compare-and-set `QUEUED → first stage`, sets `deadline_at`),
+`request_cancel`, `append_event`, `list_events`. Lease/heartbeat/expired-lease queries are
+deferred with recovery (D5). Sprint 02 ships `InMemoryJobRepository`
 (one `asyncio.Lock`); PostgreSQL implementation is Sprint 07 (ARCHITECTURE §21 note) behind the
 same protocol. No API/HTTP in Sprint 02.
 
@@ -184,11 +197,10 @@ returns the existing job (`created=False`); same key + different payload → `Id
 Execution: `claim` is compare-and-set, so a second `run(job_id)` gets `JobAlreadyClaimedError` and
 never executes search twice; search outcome can be saved once per job.
 
-**Recovery after restart.** On start-up `recover(now)`: every non-terminal, non-`QUEUED` job whose
+**Recovery after restart — DEFERRED (D5), design only.** On start-up `recover(now)`: every non-terminal, non-`QUEUED` job whose
 lease expired → `FAILED/WORKER_LOST` with `step` = its last stage. `QUEUED` jobs stay queued.
-No mid-pipeline resume (ARCHITECTURE §13). With the in-memory repository a process restart loses
-all jobs, so real restart recovery is **UNVERIFIED until Sprint 07**; Sprint 02 can only test the
-recovery logic against the repository with an injected clock.
+No mid-pipeline resume (ARCHITECTURE §13). Not implemented in Sprint 02: with the in-memory repository a process restart loses all jobs,
+and no recovery behaviour is claimed or verified until a persistent store and worker exist.
 
 **Observable events** (`job_events` rows + structured logs, all with `job_id`):
 `job.created`, `job.idempotent_hit`, `job.claimed`, `job.state_changed{from,to,reason}`,
@@ -224,3 +236,29 @@ Integration (fakes + respx-backed real adapters): successful search → `COMPLET
 query outcomes retained; cancel mid-search → `CANCELLED` with no provider call after cancel; retry
 interaction (retries cut by deadline); every log line of a job carries `job_id`, search lines also
 `request_id`; no raw query in logs. Regression: full Sprint 01 suite unchanged and green.
+
+## 12. Implementation notes (Sprint 02, as built)
+
+- Decisions applied: **D1** scope (no HTTP API, worker, PostgreSQL, LLM planner or `AIProvider`);
+  **D2** per-job `stages`, Sprint 02 pipeline `PLANNING → SEARCHING → terminal`, `PARTIAL` is the
+  outcome of the *last configured* stage; **D3-B** per-query orchestration, no change to
+  `SearchService`; **D4** Sprint 01 `provider/code/category` preserved; **D5** recovery deferred.
+- Capture guarantee: each finished query's outcome is appended to the runner's in-memory capture
+  *before* any further `await`, then persisted; the terminal save always contains every captured
+  query, so a deadline or cancel that lands during an intermediate save cannot lose it.
+- Cancellation paths: `JobRunner.cancel(job_id)` flags the job and cancels the in-flight search
+  task → `CANCELLED`, `run()` returns normally. Cancelling the task that awaits `run()` →
+  job recorded `FAILED/RUNNER_INTERRUPTED`, `CancelledError` re-raised.
+- The two time limits are constructor parameters of `JobRunner`; they are not read from the
+  environment in Sprint 02 (no worker/API process exists to own them yet).
+- Trade-off accepted (D3): the Sprint 01 circuit breaker is scoped to one `SearchService.search()`
+  call, i.e. to one query. A provider that is down is retried (per its retry policy) on every query
+  instead of being skipped after `SEARCH_CIRCUIT_BREAKER_THRESHOLD` failures.
+- Queries run sequentially in plan order (deterministic; the fixed planner yields one query).
+- Bug found during diff review (before commit): any `TimeoutError` escaping the search stage was
+  labelled `SEARCH_STAGE_TIMEOUT`/`JOB_DEADLINE_EXCEEDED`, even when raised by the search layer
+  rather than by the runner's own limit. Root cause: the handler did not check which scope
+  expired. Fix: only `asyncio.timeout(...).expired()` produces the timeout codes; anything else
+  becomes `INTERNAL_ERROR`. Regression test:
+  `test_raw_timeout_error_from_search_is_not_mislabelled_as_stage_timeout` (fails on the pre-fix
+  runner, passes after).
