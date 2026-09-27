@@ -278,3 +278,65 @@ DNS answers containing both allowed and blocked addresses make some CDNs unreach
 requiring JS/cookies return little content (`EMPTY_CONTENT`); live verification depends on environment egress.
 Deferred: job/API integration (I2), persistent cache, link following, JS rendering, PDF, proxy support,
 PERSISTENCE-BLOCKER-01 (unchanged).
+
+## 20. As built (Sprint 04 implementation)
+
+Code: `src/research_agent/crawler/` (`config`, `models`, `policy`, `robots`, `decoding`, `network`, `crawler`).
+Standalone (I1): JobRunner, API, SearchService and Sprint 01–03 files are unchanged. No dependency added.
+
+Differences from / refinements of the design above:
+
+- **Settings** (`CrawlerSettings`, prefix `CRAWL_`): `TIMEOUT_S` 15, `CONNECT_TIMEOUT_S` 5, `READ_TIMEOUT_S` 10,
+  `MAX_RESPONSE_BYTES` 5 MiB (decoded), `MAX_REDIRECTS` 5, `RETRIES` 1 (max 1), `RETRY_BACKOFF_S` 1,
+  `CONCURRENCY` 5, `PER_HOST_CONCURRENCY` 1, `PER_HOST_MIN_INTERVAL_S` 1, `ROBOTS_TIMEOUT_S` 5,
+  `ROBOTS_MAX_BYTES` 512 KiB, `ROBOTS_CACHE_TTL_S` 86400 (in memory, per crawler), `CA_BUNDLE` (optional).
+  `CRAWL_MAX_URLS` belongs to job integration (I2) and is not implemented. Ports are fixed to `{80, 443}`
+  (not configurable; only the test-only `UnsafeTestOverrides` can add a port). No setting disables SSRF, robots,
+  TLS verification or the port policy.
+- **User-Agent**: `ResearchAgentCrawler/<version>`, no contact URL (OD-9: owner has not provided one; none invented).
+- **Robots failure mapping**: 2xx → rules; 4xx → allow (`UNAVAILABLE_ALLOW`); 5xx, timeout, oversize, or a
+  connection dropped after connect → deny (`ROBOTS_BLOCKED`, `UNREACHABLE_DISALLOW`). Connection-level failures
+  of the robots fetch (DNS, connect refused/reset, connect timeout, TLS) are reported with that network status
+  (e.g. `DNS_ERROR`) and robots outcome `UNREACHABLE_DISALLOW` — the page is still never fetched, but the result
+  says *why* the host was unreachable instead of masking it as a robots decision. robots.txt redirects follow the
+  same policy (≤ 5, every hop checked, https→http denied).
+- **`RETRY_EXHAUSTED`** is returned only after a real second attempt failed (`error.cause` = last status); with
+  no retry performed (retries = 0, non-retryable status, or a `Retry-After` beyond the deadline) the original
+  status (e.g. `HTTP_ERROR` 429) is returned with `attempts = 1`.
+- **Logging**: `crawl.fetch` carries crawl_id, job_id, request_id, host, status, http_status, duration_ms, bytes,
+  redirects, attempts. No URL path/query, headers, cookies or bodies.
+- **Proxy / trust**: the client and transport use `trust_env=False`; an explicit transport means httpx never reads
+  proxy variables, and an explicit `SSLContext` means `SSL_CERT_FILE`/`SSL_CERT_DIR` are ignored. The only way to
+  change trusted CAs is `CRAWL_CA_BUNDLE` (verification stays on).
+- **Fail closed**: if httpx internals change (`_pool` missing or of another type) construction raises
+  `CrawlerSetupError`; a response on a connection the guarded backend did not record → `SSRF_BLOCKED`.
+
+### Mutation testing (each mutant applied alone, restored afterwards)
+
+| Mutant | Result |
+|---|---|
+| M1 connect-time SSRF check removed / M1b URL-level SSRF check removed | killed / killed |
+| M2 redirect hop not re-validated | killed |
+| M3 client `trust_env=True` | killed (`test_client_never_trusts_environment`) |
+| M3b transport `trust_env=True` | **equivalent**: the transport's pool is replaced and the `SSLContext` is explicit, so the flag has no reachable effect in httpx 0.28.1 |
+| M3c default TLS context built with `trust_env=True` | killed (`test_ssl_cert_file_env_does_not_change_trust`) |
+| M4 decompression limit removed / M4b httpx `aiter_bytes` decoder | killed / killed |
+| M5 https→http page redirect allowed / M5b robots redirect downgrade allowed | killed / killed |
+| M6 robots disallow ignored | killed |
+| M7 port policy removed | killed |
+| M8 `CancelledError` swallowed | killed |
+| M9 cookies accepted | killed |
+| M10 permanent failures retried | killed |
+| M11 unrecorded-connection check removed | killed |
+| M12 caller deadline ignored | killed |
+| M13 per-host limit / M14 global limit removed | killed / killed |
+| M15 address policy reduced to `not is_global` | killed |
+
+### Real-web verification (environment note)
+
+Run: `RUN_LIVE_NETWORK=1 CRAWL_CA_BUNDLE=<inspection CA bundle> uv run pytest -m live_network -s tests/live`.
+In the Sprint 04 sandbox outbound TLS is re-terminated by an egress proxy (hence `CRAWL_CA_BUNDLE`; verification
+on), and the egress policy denies many hosts (example.com, rfc-editor.org, python.org returned 403 from the
+policy layer, not from the site). These denials were not routed around; the live test uses reachable hosts
+(pypi.org, raw.githubusercontent.com). Result: HTML page, plain text, http→https redirect OK; robots wildcard
+disallows (`/pypi/*/json`, `/search*`), metadata IP, localhost and port 8443 blocked before any request.
