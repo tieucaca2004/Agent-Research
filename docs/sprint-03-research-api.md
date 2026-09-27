@@ -1,6 +1,7 @@
 # Sprint 03 — Research API / execution boundary (design)
 
-Status: **DESIGN — awaiting approval of §20 open decisions. Nothing here is implemented.**
+Status: **IMPLEMENTED** (design `7cc5a58`; decisions in §22 override the proposals where they differ).
+Code: `src/research_agent/api/` (`app`, `middleware`, `service`, `executor`, `schemas`, `errors`, `config`, `__main__`).
 Baseline: `42d1628` (Sprint 02 implementation; Sprint 01 frozen at `cdd1234`, Sprint 02 design `c9bd503`).
 This document changes no code. Probe scripts ran from a scratch directory against test doubles and were deleted.
 
@@ -321,3 +322,50 @@ Auth, rate limiting, persistence + restart recovery, worker/queue, admission con
 | Concurrency | unbounded / cap | unbounded, documented (OD7) | no requirement yet | cost/rate-limit risk |
 | Authentication | now / deferred | deferred, localhost binding | not approved for this sprint | not deployable publicly |
 | Timeout boundary | tie job to request / decouple | decoupled (4 layers + HTTP) | job must outlive requests | clients must poll |
+
+## 22. Approved decisions and as-built behaviour
+
+| Id | Decision | As built |
+|---|---|---|
+| OD1 | APPROVED | Sprint 03 = HTTP API / execution boundary; roadmap in ARCHITECTURE §21 shifted (Crawler → Sprint 04 …) |
+| OD2 | APPROVED | `GET /research/{job_id}/results` |
+| OD3 | APPROVED | same key + same request → existing job (200, `meta.idempotent_replay=true`); same key + different payload → **409** `CONFLICT` / `IDEMPOTENCY_KEY_REUSED` |
+| OD4 | **MODIFIED** | job outcome ≠ HTTP outcome. Results: not terminal → 409 `JOB_NOT_FINISHED`; COMPLETED/PARTIAL/CANCELLED → 200 (captured results, may be empty); **FAILED with captured results → 200** with `status=FAILED`, `coverage`, results and `error`; **FAILED without any result → 409** `CONFLICT` / `JOB_FAILED`, `details.job_error = {code, category, step, message, provider_errors}` |
+| OD5 | APPROVED | logs: `http_request_id` (HTTP), `job_id` (job), `request_id` only for Sprint 01 search execution; envelope `meta.request_id` + `X-Request-ID` header carry the HTTP id |
+| OD6 | APPROVED | no auth, no rate limiting; default bind `127.0.0.1`; **local/internal API boundary, not a public production API** |
+| OD7 | **MODIFIED** | explicit policy in `JobExecutor`: `MAX_CONCURRENT_JOBS` (default **2**) executing, `MAX_QUEUED_JOBS` (default **20**) waiting as `QUEUED` (deadline starts at claim); beyond → **503** `CAPACITY_EXHAUSTED` + `Retry-After: 5`. Admission is reserved synchronously before the job is created (independent of repository yielding). Not a queue/worker: in memory, lost on restart |
+| OD8 | APPROVED | no `/status`; `GET /research/{job_id}` is the polling endpoint |
+| OD9 | APPROVED | `Idempotency-Key` optional, format `^[A-Za-z0-9._:-]{1,128}$` |
+| OD10 | **MODIFIED** | JobRunner unchanged; recorded as **PERSISTENCE-BLOCKER-01** (below) |
+| OD11 | APPROVED | added `fastapi` 0.141.1 and `uvicorn` 0.54.0 (lockfile: only new packages `fastapi, starlette, uvicorn, click, annotated-doc`; no existing version changed) |
+
+### PERSISTENCE-BLOCKER-01
+
+`JobRunner` (Sprint 02) is verified only with a repository whose calls never yield to the event loop
+(`InMemoryJobRepository`, probe A3). Probe A5 showed that with a repository that suspends per call
+(real async I/O) a cancel racing claim/save/finish produced `JobVersionConflictError` with the job stuck
+in `PLANNING`/`SEARCHING` (5/60) and a user cancel turned into `FAILED` (1/60). Before any async
+I/O-backed repository (e.g. PostgreSQL, Sprint 07+) is introduced:
+- claim / save / cancel concurrency must be revalidated;
+- the race must be covered by tests (cancel vs claim, progress save, terminal save);
+- no job may be left non-terminal, cancellation must never become `FAILED`, no state may be lost.
+The "repository does not yield" assumption must not be carried into the persistence sprint.
+
+### Other as-built notes
+
+- Cancel-before-claim (probe A4) is handled as expected control flow: the executor catches
+  `JobNotClaimableError`, logs `job.not_started` (info) — the job stays `CANCELLED`, is never claimed,
+  and no search runs. Covered by `test_cancel_before_runner_claim_stays_cancelled_without_search`.
+- Cancel HTTP status is derived from the job state *after* the cancel request: `CANCELLED` → 200,
+  still running with `cancel_requested` → 202, finished otherwise → 409 `JOB_ALREADY_FINISHED`.
+- Request body limit (`API_MAX_BODY_BYTES`, 16 KiB): checked on `Content-Length` and on the streamed
+  body. The middleware buffers the body (≤ limit) itself because FastAPI converts exceptions raised
+  while it reads the body into 400 (found while testing chunked uploads).
+- Job execution tasks start with a fresh `contextvars.Context`: execution logs carry `job_id`
+  (+ search `request_id`) but never the creating request's `http_request_id`; the link is the
+  repository event `api.job_submitted {http_request_id}`.
+- Known limitation: when capacity is exhausted, admission is checked before the idempotency lookup,
+  so an idempotent replay is also answered 503 in that state (the repository has no key lookup
+  without creating; not changed to keep Sprint 02 untouched).
+- OpenAPI/docs endpoints are disabled; uvicorn access log disabled (replaced by `http.request`).
+- Run locally: `uv run python -m research_agent.api` (binds `API_HOST`, default 127.0.0.1).

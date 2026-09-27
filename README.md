@@ -3,7 +3,8 @@
 Natural-language query → research plan → web search → crawl → extraction → normalization →
 dedup → verification → provenance → results. Design: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Current state: **Sprint 02 — Research Job** (job lifecycle in `src/research_agent/jobs/`, see
+Current state: **Sprint 03 — Research API** (local/internal HTTP API, see
+[docs/sprint-03-research-api.md](docs/sprint-03-research-api.md)) on top of **Sprint 02 — Research Job** (job lifecycle in `src/research_agent/jobs/`, see
 [docs/sprint-02-research-job.md](docs/sprint-02-research-job.md)) on top of **Sprint 01 — Core Search** (search provider abstraction, Perplexity + Google
 CSE adapters, URL normalization, `SearchService`). Provider contracts: [docs/providers.md](docs/providers.md).
 
@@ -20,7 +21,12 @@ uv run mypy                                           # strict type check (src +
 uv run pytest                                         # unit + mocked integration (+ live, skipped without keys)
 uv run pytest -m live -rs                             # live provider tests only
 uv run bandit -q -r src -c pyproject.toml             # static security scan
+
+uv run python -m research_agent.api                   # local API on 127.0.0.1:8000
 ```
+
+The API is a **local/internal boundary**: no authentication and no rate limiting yet — do not expose it
+publicly. Jobs are kept in memory and lost on restart.
 
 Live tests without credentials are **skipped** with reason `REQUIRES_CONFIGURATION: <VARS>` —
 a skip is never counted as a pass.

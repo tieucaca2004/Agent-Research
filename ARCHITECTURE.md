@@ -34,7 +34,7 @@ Consequence: this is a greenfield project. Stack is chosen below, not inherited.
 | HTML parsing | **selectolax** (fast DOM) + **trafilatura** (main-content extraction) | Noise removal without AI. Fallback to plain DOM text when trafilatura returns nothing. |
 | Fuzzy matching | **rapidfuzz** | Deterministic string similarity for entity resolution. |
 | DB | **PostgreSQL 16**, SQLAlchemy 2.0 (async, asyncpg), **Alembic** migrations | Spec requirement; JSONB for flexible attributes. |
-| Job execution | **In-process async worker** polling a DB-backed queue (`SELECT … FOR UPDATE SKIP LOCKED`) | No Redis/Celery in V1. Job state lives in Postgres → survives restarts, inspectable. |
+| Job execution | **In-process async worker** polling a DB-backed queue (`SELECT … FOR UPDATE SKIP LOCKED`) | No Redis/Celery in V1. Job state lives in Postgres → survives restarts, inspectable. *Until persistence exists (Sprint 03 decision): in-process `JobExecutor` tasks with a bounded concurrency policy, no queue/worker — see docs/sprint-03-research-api.md.* |
 | Frontend | **Static HTML + vanilla JS** served by FastAPI | No build step; V1 does not need a SPA. Can be replaced later without touching the backend. |
 | Export | stdlib `json`/`csv` + **openpyxl** (XLSX) | |
 | Tests | **pytest**, pytest-asyncio, respx (HTTP mocks), real Postgres via local `initdb` or Docker for integration tests | |
@@ -455,6 +455,14 @@ Uniform envelope:
 
 Error codes: `VALIDATION_ERROR, NOT_FOUND, CONFLICT, RATE_LIMITED, REQUIRES_CONFIGURATION, INTERNAL_ERROR`.
 
+Sprint 03 (implemented, local/internal only — no auth, no rate limiting, binds 127.0.0.1): `POST /research`
+(202 new / 200 idempotent replay / 409 key reuse / 503 `REQUIRES_CONFIGURATION` or `CAPACITY_EXHAUSTED`,
+data `{job_id, status, created_at}`), `GET /research/{job_id}` (status/polling; `/status` dropped),
+`GET /research/{job_id}/results`, `POST /research/{job_id}/cancel`, `GET /health`. Errors add an optional
+`reason` (e.g. `JOB_NOT_FOUND`, `IDEMPOTENCY_KEY_REUSED`, `JOB_NOT_FINISHED`, `JOB_FAILED`,
+`JOB_ALREADY_FINISHED`, `PAYLOAD_TOO_LARGE`) and `CAPACITY_EXHAUSTED` is an additional code. `/sources`,
+`/export`, pagination: later sprints. Contract details: [docs/sprint-03-research-api.md](docs/sprint-03-research-api.md).
+
 ## 15. Frontend (V1)
 
 Single page, served at `/`:
@@ -529,16 +537,22 @@ STALE_AFTER_DAYS=365, RATE_LIMIT_RESEARCH_PER_MIN=5, LOG_LEVEL
 |---|---|---|
 | 01 Core Search | project scaffold, config, logging, `SearchProvider` + `SearchResult`, Perplexity & Google providers, URL normalizer, `SearchService` fan-out/dedup/retry | unit + mocked-HTTP tests pass; live test PASS or REQUIRES CONFIGURATION |
 | 02 Research Job | job model, state machine with per-job stages, in-memory repository + events, in-process `JobRunner` (per-query search orchestration, stage timeout, job deadline, cancellation), fixed planner (`queries = [query]`) | lifecycle/state-machine/runner tests; Sprint 01 suite unchanged. *Moved out (decision D1): HTTP API, worker, LLM planner via AIProvider, lease recovery.* |
-| 03 Crawler | bounded queue, robots, SSRF guard, rate limit, retry, cache, parser | fixture + respx tests, failure tests |
-| 04 Extraction | AIProvider impls (OpenAI, Anthropic), structured extraction, evidence check, JSON-LD path | malformed/timeout tests; live structured-output check |
-| 05 Normalization + Dedup | normalizers, entity resolution, thresholds | table-driven tests incl. VN formats |
-| 06 Verification | checks, conflict handling, confidence | unit tests per check |
-| 07 Database | Alembic migrations, repositories, full persistence wiring (in-memory store used before this) | integration test on real Postgres |
-| 08 UI | static page | manual + Playwright smoke test |
-| 09 Export | JSON/CSV/XLSX incl. provenance columns | file content tests |
-| 10 Hardening | rate limiting, metrics endpoint, timeouts, acceptance test run | acceptance report |
+| 03 Research API | local/internal HTTP API (FastAPI): create/get/results/cancel/health, idempotency, bounded in-process execution, error mapping (docs/sprint-03-research-api.md) | API + regression tests |
+| 04 Crawler | bounded queue, robots, SSRF guard, rate limit, retry, cache, parser | fixture + respx tests, failure tests |
+| 05 Extraction | AIProvider impls (OpenAI, Anthropic), structured extraction, evidence check, JSON-LD path | malformed/timeout tests; live structured-output check |
+| 06 Normalization + Dedup | normalizers, entity resolution, thresholds | table-driven tests incl. VN formats |
+| 07 Verification | checks, conflict handling, confidence | unit tests per check |
+| 08 Database | Alembic migrations, repositories, full persistence wiring (in-memory store used before this); **must resolve PERSISTENCE-BLOCKER-01 first** | integration test on real Postgres |
+| 09 UI | static page | manual + Playwright smoke test |
+| 10 Export | JSON/CSV/XLSX incl. provenance columns | file content tests |
+| 11 Hardening | authentication, rate limiting, metrics endpoint, timeouts, acceptance test run | acceptance report |
 
-Note: Sprint 07 is "Database" per the spec's order; to avoid building throw-away persistence, Sprints 02–06 use a **repository interface** with an in-memory implementation for unit tests, and Sprint 07 adds the Postgres implementation + migrations behind the same interface.
+Roadmap shifted by one from Sprint 03 on (decision OD1): the Research API became Sprint 03.
+**PERSISTENCE-BLOCKER-01**: the Sprint 02 `JobRunner` is verified only with a repository that never yields to
+the event loop; before an async I/O repository is introduced, claim/save/cancel races must be revalidated and
+tested (no stuck jobs, cancel never → FAILED, no lost state) — see docs/sprint-03-research-api.md §22.
+
+Note: the Database sprint (originally 07, now 08) follows the spec's order; to avoid building throw-away persistence, Sprints 02–06 use a **repository interface** with an in-memory implementation for unit tests, and Sprint 07 adds the Postgres implementation + migrations behind the same interface.
 
 Freeze rule: once a sprint's component is PASS with evidence, it is frozen; changes only with a reproduced defect or new evidence.
 
