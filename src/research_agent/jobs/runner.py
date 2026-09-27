@@ -33,6 +33,7 @@ import structlog
 
 from research_agent.core.errors import AllSearchProvidersFailedError
 from research_agent.core.models import SearchOptions
+from research_agent.jobs.errors import JobVersionConflictError
 from research_agent.jobs.models import (
     SPRINT_02_STAGES,
     AttemptRecord,
@@ -56,6 +57,10 @@ from research_agent.pipeline.search import SearchAttempt, SearchRun, SearchServi
 log = get_logger(__name__)
 
 Clock = Callable[[], datetime]
+
+_CONFLICT_RETRIES = 3
+"""Re-read/re-apply attempts after a version conflict (the only concurrent writer is
+``request_cancel``, which writes at most once per job)."""
 
 
 def _utcnow() -> datetime:
@@ -166,12 +171,15 @@ class JobRunner:
                     "INTERNAL_ERROR", JobState.PLANNING, f"planner raised {type(exc).__name__}"
                 ),
             )
-        job = await self._repo.save(
-            job.model_copy(update={"plan": plan, "updated_at": self._clock()}),
-            expected_version=job.version,
-            event="job.plan_created",
-            data={"planner": plan.planner, "queries": len(plan.queries)},
-        )
+        try:
+            job = await self._save_update(
+                job,
+                {"plan": plan, "updated_at": self._clock()},
+                event="job.plan_created",
+                data={"planner": plan.planner, "queries": len(plan.queries)},
+            )
+        except _JobCancelled:
+            return await self._finish_cancelled(job.id)
         log.info(
             "job.stage_finished",
             stage=JobState.PLANNING.value,
@@ -199,9 +207,10 @@ class JobRunner:
         plan = job.plan
         if plan is None:  # _planning always stores a plan before this stage
             raise RuntimeError("SEARCHING entered without a plan")
-        job = await self._repo.save(
-            job.model_copy(
-                update={
+        try:
+            job = await self._save_update(
+                job,
+                {
                     "status": JobState.SEARCHING,
                     "updated_at": self._clock(),
                     "progress": JobProgress(
@@ -210,10 +219,12 @@ class JobRunner:
                         total_stages=len(job.stages),
                         queries_total=len(plan.queries),
                     ),
-                }
-            ),
-            expected_version=job.version,
-        )
+                },
+            )
+        except _JobCancelled:
+            return await self._finish_cancelled(job.id)
+        if job.is_terminal:  # finalized concurrently: never search for a finished job
+            return job
         log.info("job.stage_started", stage=JobState.SEARCHING.value, queries=len(plan.queries))
         started = time.monotonic()
         capture = _SearchCapture(outcomes=[], runs=[])
@@ -326,15 +337,13 @@ class JobRunner:
         self, job_id: str, plan: ResearchPlan, capture: _SearchCapture, outcome: QueryOutcome
     ) -> None:
         job = await self._repo.get(job_id)
-        await self._repo.save(
-            job.model_copy(
-                update={
-                    "updated_at": self._clock(),
-                    "result": self._result(job, plan, capture),
-                    "progress": self._progress(job, plan, capture),
-                }
-            ),
-            expected_version=job.version,
+        await self._save_update(
+            job,
+            {
+                "updated_at": self._clock(),
+                "result": self._result(job, plan, capture),
+                "progress": self._progress(job, plan, capture),
+            },
             event="job.search.query_finished",
             data={
                 "index": outcome.index,
@@ -457,6 +466,8 @@ class JobRunner:
         error: JobError | None = None,
         warnings: list[JobError] | None = None,
     ) -> ResearchJob:
+        if job.is_terminal:
+            return job
         now = self._clock()
         update: dict[str, object] = {
             "status": status,
@@ -489,9 +500,14 @@ class JobRunner:
         data: dict[str, object] = {"status": status.value}
         if error is not None:
             data.update({"code": error.code, "category": error.category, "step": error.step.value})
-        saved = await self._repo.save(
-            job.model_copy(update=update), expected_version=job.version, event=event, data=data
-        )
+        try:
+            saved = await self._save_update(job, update, event=event, data=data)
+        except _JobCancelled:  # cancel recorded while finishing: cancel wins (precedence)
+            return await self._finish(
+                await self._repo.get(job.id), JobState.CANCELLED, result=result
+            )
+        if saved.status is not status:  # already finalized concurrently: report what is stored
+            return saved
         log_method = log.warning if status in (JobState.FAILED, JobState.CANCELLED) else log.info
         log_method(
             event,
@@ -523,6 +539,45 @@ class JobRunner:
         )
 
     # -- helpers ------------------------------------------------------------------------
+
+    async def _save_update(
+        self,
+        job: ResearchJob,
+        update: dict[str, object],
+        *,
+        event: str | None = None,
+        data: dict[str, object] | None = None,
+    ) -> ResearchJob:
+        """Store ``update`` on ``job`` with optimistic versioning, safe against a concurrent
+        ``cancel()`` (OI-1).
+
+        Every write still requires the version it was based on. On ``JobVersionConflictError``
+        the job is re-read: a terminal job is returned as-is; a recorded cancel raises
+        ``_JobCancelled`` (unless this write is the CANCELLED write itself) so the caller
+        finalizes CANCELLED instead of losing the cancel; otherwise the same update is
+        re-applied on the fresh version.
+        """
+        attempts = 0
+        while True:
+            try:
+                return await self._repo.save(
+                    job.model_copy(update=update),
+                    expected_version=job.version,
+                    event=event,
+                    data=data,
+                )
+            except JobVersionConflictError:
+                job = await self._repo.get(job.id)
+                if job.is_terminal:
+                    return job
+                if job.cancel_requested and update.get("status") is not JobState.CANCELLED:
+                    raise _JobCancelled from None
+                attempts += 1
+                if attempts > _CONFLICT_RETRIES:
+                    raise  # an unknown concurrent writer keeps winning: surface it
+
+    async def _finish_cancelled(self, job_id: str) -> ResearchJob:
+        return await self._finish(await self._repo.get(job_id), JobState.CANCELLED)
 
     def _seconds_left(self, job: ResearchJob) -> float:
         if job.deadline_at is None:
