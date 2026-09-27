@@ -31,7 +31,7 @@ Consequence: this is a greenfield project. Stack is chosen below, not inherited.
 | Package manager | **uv** (`pyproject.toml` + `uv.lock`) | Fast, reproducible lockfile; installed. |
 | API framework | **FastAPI** + Pydantic v2 | Typed request/response models, schema validation reused for structured AI output. |
 | HTTP client | **httpx** (async) | Timeouts, redirects, connection limits; mockable with `respx`. |
-| HTML parsing | **selectolax** (fast DOM) + **trafilatura** (main-content extraction) | Noise removal without AI. Fallback to plain DOM text when trafilatura returns nothing. |
+| HTML parsing | stdlib **`html.parser`** + own bounded tree (Sprint 05 decision; originally selectolax + trafilatura) | No dependency; linear, bounded, offline. See docs/sprint-05-extraction-design.md (ADR 1). |
 | Fuzzy matching | **rapidfuzz** | Deterministic string similarity for entity resolution. |
 | DB | **PostgreSQL 16**, SQLAlchemy 2.0 (async, asyncpg), **Alembic** migrations | Spec requirement; JSONB for flexible attributes. |
 | Job execution | **In-process async worker** polling a DB-backed queue (`SELECT … FOR UPDATE SKIP LOCKED`) | No Redis/Celery in V1. Job state lives in Postgres → survives restarts, inspectable. *Until persistence exists (Sprint 03 decision): in-process `JobExecutor` tasks with a bounded concurrency policy, no queue/worker — see docs/sprint-03-research-api.md.* |
@@ -244,7 +244,7 @@ Behaviour:
   "links": [{"url": "…", "text": "…"}], "metadata": {"lang": "vi", "published_at": null, "fetched_at": "…", "content_hash": "…"} }
 ```
 
-- Strip `script/style/noscript/iframe/svg/nav/footer` noise; main-content via trafilatura, fallback to body text.
+- As built in Sprint 05 (docs/sprint-05-extraction-design.md): non-content and invisible elements dropped; main content = `<main>` → `<article>` → articles' common ancestor → `<body>` (link-dense blocks pruned, flagged low confidence); page-level header/footer/aside and `nav` removed; structure-preserving Markdown-oriented text.
 - Keep **JSON-LD / schema.org** blocks (`Restaurant`, `Menu`, `MenuItem`, `Product`, `Offer`) in `metadata.structured_data` — high-quality deterministic evidence.
 - Text normalized to NFC, whitespace collapsed; offsets refer to this stored text so evidence spans are stable.
 - Documents are chunked (≈ 6–8k tokens, overlap) for extraction; chunk offsets are retained.
@@ -539,7 +539,7 @@ STALE_AFTER_DAYS=365, RATE_LIMIT_RESEARCH_PER_MIN=5, LOG_LEVEL
 | 02 Research Job | job model, state machine with per-job stages, in-memory repository + events, in-process `JobRunner` (per-query search orchestration, stage timeout, job deadline, cancellation), fixed planner (`queries = [query]`) | lifecycle/state-machine/runner tests; Sprint 01 suite unchanged. *Moved out (decision D1): HTTP API, worker, LLM planner via AIProvider, lease recovery.* |
 | 03 Research API | local/internal HTTP API (FastAPI): create/get/results/cancel/health, idempotency, bounded in-process execution, error mapping (docs/sprint-03-research-api.md) | API + regression tests |
 | 04 Crawler | bounded queue, robots, SSRF guard, rate limit, retry, cache, parser | fixture + respx tests, failure tests |
-| 05 Extraction | AIProvider impls (OpenAI, Anthropic), structured extraction, evidence check, JSON-LD path | malformed/timeout tests; live structured-output check |
+| 05 Content extraction | FetchResult → ExtractedDocument: HTML/text parsing, main content, title, normalization, links, claimed metadata, raw JSON-LD, limits, untrusted-data boundary (docs/sprint-05-extraction-design.md) | unit/integration/security/mutation/benchmark tests; real-web test |
 | 06 Normalization + Dedup | normalizers, entity resolution, thresholds | table-driven tests incl. VN formats |
 | 07 Verification | checks, conflict handling, confidence | unit tests per check |
 | 08 Database | Alembic migrations, repositories, full persistence wiring (in-memory store used before this); **must resolve PERSISTENCE-BLOCKER-01 first** | integration test on real Postgres |
@@ -548,6 +548,7 @@ STALE_AFTER_DAYS=365, RATE_LIMIT_RESEARCH_PER_MIN=5, LOG_LEVEL
 | 11 Hardening | authentication, rate limiting, metrics endpoint, timeouts, acceptance test run | acceptance report |
 
 Roadmap shifted by one from Sprint 03 on (decision OD1): the Research API became Sprint 03.
+Sprint 05 became content extraction (decision OD-1 of Sprint 05); AI structured extraction (AIProvider impls, evidence check, JSON-LD interpretation) is not yet scheduled.
 **PERSISTENCE-BLOCKER-01**: the Sprint 02 `JobRunner` is verified only with a repository that never yields to
 the event loop; before an async I/O repository is introduced, claim/save/cancel races must be revalidated and
 tested (no stuck jobs, cancel never → FAILED, no lost state) — see docs/sprint-03-research-api.md §22.

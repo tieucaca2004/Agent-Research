@@ -553,3 +553,79 @@ Open decisions:
 | OD-9 | Limits | defaults in §16 |
 | OD-10 | Execution | sync `extract` + `aextract` via `to_thread`, `EXTRACT_CONCURRENCY=2`, `EXTRACT_TIMEOUT_S=10` |
 | OD-11 | `noscript` | drop, with `JS_REQUIRED_SUSPECTED` on empty output |
+
+## 33. As built (Sprint 05 implementation)
+
+Code: `src/research_agent/extraction/` (`config`, `models`, `text`, `tree`, `content`, `extractor`). Standalone:
+no change to Sprint 01–04 code (S04 frozen at `54164fe`), JobRunner or API. No dependency added.
+
+Refinements made during implementation (all within the approved design):
+
+- **Field names**: the page-declared language is `claimed_language` (+ `language_source`), to make "claimed, not
+  verified" explicit; `ExtractedDocument.kind = "source_document"` and `trust = "UNTRUSTED"` are constants.
+  `requested_url`, `final_url`, `content_type`, `charset`, `content_sha256` are read-only properties over
+  `provenance` (one provenance record, no duplication). The raw body is **not** copied into the document.
+- **Hashes**: `content_sha256` = crawler's SHA-256 of the fetched (decompressed) body bytes (raw);
+  `text_sha256` = SHA-256 of `ExtractedDocument.text` in UTF-8 (normalized extracted text). No similarity.
+- **html.parser treats `<title>` as RCDATA** (Python 3.11.15, like browsers): markup inside a title is literal
+  title text; it is still plain data.
+- **Text events are joined** per element (html.parser emits one event per `<` in a `<<<<` run): the 5 MiB
+  `<`-storm went from 8.4 s / +130 MB to ~5.5 s / +47 MB.
+- **Links** are examined main-content first and only until 500 are kept (or 20 × `max_links` candidates were
+  examined); identical `href` values are resolved once; unexamined candidates → `LINKS_TRUNCATED`
+  (`links_dropped.not_examined`). Dropped links are counted per reason (`javascript`, `data`, `mailto`, `tel`,
+  `credentials`, `fragment`, `duplicate`, `too_long`, `invalid`, `other_scheme`, …).
+- **Deadline**: checked before every 64 KiB parser chunk and every 512 rendered elements. If parsing times out,
+  the (bounded) partial tree is still rendered with cancel-only checks — that text is the `PARTIAL` result.
+  Cancellation (`aextract`) sets an event checked at the same points; the semaphore slot is held until the
+  worker thread has stopped, then `CancelledError` propagates.
+- **Tables**: a table whose cells contain sectioning/heading/form elements is a layout table (cells rendered as
+  ordinary blocks); nested data tables are flattened into their cell (pipes escaped).
+- **Swallow guard** applies to `nav`/page-level boilerplate and to link-dense pruning; boilerplate removal runs
+  inside the selected container (page-level blocks outside the selection are never rendered anyway).
+- **Oversized-tag guard**: `<[A-Za-z/!?][^<>]{32767,}>?` removed before parsing, counted in
+  `stats.oversized_tags_removed` with warning `OVERSIZED_TAG_REMOVED` (text after the tag survives).
+- **S04 charset findings SF-1…SF-3: NOT MODIFIED.** S05 reads the decoded text as-is, never re-decodes, and only
+  reports `CHARSET_SUSPECT` / `DECODING_ERRORS`; `claimed_metadata.declared_charset` records the page's claim.
+
+### Tests
+
+`tests/unit/test_extraction_text.py`, `tests/unit/test_extraction_tree.py`, `tests/integration/test_extraction.py`
+(fixtures: hand-written synthetic pages in `tests/fixtures/extraction/`), `tests/integration/test_extraction_benchmark.py`
+(marker `benchmark`), `tests/live/test_extraction_live.py` (marker `live_network`, opt-in).
+
+### Mutation testing (each mutant alone; S05 unit + integration suite; restored afterwards)
+
+All killed: X1 script removal, X2 style removal, X3 charset signals, X4 NFC removed, X4b NFKC, X4c ZWJ stripped,
+X5a–d text/link/title-metadata/input limits, X6/X6b javascript scheme checks, X7 og:title first, X7b svg title,
+X8 raw HTML as text, X9/X9b provenance, X10 `hidden`, X10b `display:none`, X10c `aria-hidden` treated as hidden
+(with the attribute whitelisted), X11 long-tag guard, X12a/b parse/render deadline, X12c cancel check, X13 article
+header as boilerplate, X13b swallow guard, X13c `<form>` removed, X13d link-dense pruning everywhere, X14 `<pre>`
+collapsed, X14b table flattened, X15 last duplicate attribute wins, X16 `EMPTY` → `FAILED`.
+Equivalent: X10c without whitelisting `aria-hidden` — the tree never stores that attribute, so a check on it can
+never fire.
+
+### Benchmark (this sandbox, subprocess per scenario; peak RSS growth via VmHWM reset)
+
+| Scenario | Input chars | Duration | Peak RSS growth | Output chars | Status |
+|---|---|---|---|---|---|
+| small_html | 1 465 | 0.002 s | 0.1 MB | 1 003 | SUCCESS |
+| medium_article | 76 056 | 0.05 s | 1.3 MB | 53 598 | SUCCESS |
+| large_text (5 MiB) | 5 242 876 | 2.1 s | 73 MB | 971 029 | SUCCESS (`STRUCTURE_LIMIT`) |
+| large_html (5 MiB div-soup) | 5 242 901 | 3.4 s | 51 MB | 258 873 | SUCCESS (`STRUCTURE_LIMIT`) |
+| pathological_start_tag (600 k attributes) | 5 888 914 | 0.05 s | 0.0 MB | 8 | SUCCESS (`OVERSIZED_TAG_REMOVED`) |
+| deep_nesting (1 M `<div>`) | 5 242 884 | 2.6 s | 8 MB | 4 | SUCCESS (`STRUCTURE_LIMIT`) |
+| large_metadata (600 × 8 KB meta) | 4 821 650 | 0.06 s | 0.3 MB | 4 | SUCCESS (`METADATA_TRUNCATED`) |
+| lt_storm (5 MiB `<`) | 5 242 880 | 5.3 s | 47 MB | 1 000 000 | PARTIAL (`TEXT_TRUNCATED`) |
+| emoji + Vietnamese text/plain | 2 708 811 | 0.24 s | 21 MB | 999 997 | PARTIAL (`TEXT_TRUNCATED`) |
+
+Machine noise of ±2 s was observed between runs on the same input; the benchmark test uses the best of two runs.
+
+### Real-web (S04 crawler → S05, hosts allowed by the sandbox egress policy)
+
+| Case | URL | Result |
+|---|---|---|
+| HTML page with metadata and links | `https://pypi.org/project/httpx/` | SUCCESS, MAIN, title `httpx · PyPI`, lang `en`, og:title `httpx`, 9 154 chars, 158 links, robots ALLOWED |
+| documentation page | `https://pypi.org/help/` | SUCCESS, MAIN, 36 090 chars, 120 links |
+| plain text | `https://raw.githubusercontent.com/python/cpython/main/LICENSE` | SUCCESS, PLAIN_TEXT, 13 803 chars |
+| redirect | `http://pypi.org/` | SUCCESS, final `https://pypi.org/`, redirect 301, `LOW_CONFIDENCE_MAIN_CONTENT` (small `<main>`) |

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Configuration — ExampleTool docs</title></head>
+<body>
+<nav class="sidebar"><ul><li><a href="/install">Install</a></li><li><a href="/config">Configuration</a></li><li><a href="/api">API</a></li></ul></nav>
+<main>
+<h1>Configuration</h1>
+<section id="env">
+<h2>Environment variables</h2>
+<p>Set <code>TOOL_TIMEOUT</code> to change the timeout (default <code>30</code> seconds).</p>
+<table>
+<thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>TOOL_TIMEOUT</code></td><td>30</td><td>Seconds before a request is abandoned</td></tr>
+<tr><td><code>TOOL_RETRIES</code></td><td>1</td><td>Retries for transient errors</td></tr>
+</tbody>
+</table>
+</section>
+<section id="example">
+<h2>Example</h2>
+<pre><code>export TOOL_TIMEOUT=10
+tool run --retries=2   # two retries
+	indented with a tab</code></pre>
+<ol><li>Install the tool.</li><li>Export the variables.<ul><li>Use a <code>.env</code> file for local runs.</li></ul></li><li>Run it.</li></ol>
+<blockquote><p>Note: values are read once at start-up.</p></blockquote>
+</section>
+</main>
+<footer>Docs licensed CC-BY 4.0</footer>
+</body>
+</html>
