@@ -9,6 +9,10 @@ Endpoints (envelope ``{data, error, meta{request_id}}``, ARCHITECTURE §14):
     GET  /research/{job_id}/results    results (see ``get_results`` for status rules)
     POST /research/{job_id}/cancel     200 CANCELLED | 202 cancel requested | 409 finished
     GET  /health                       provider configuration + executor load
+
+Sprint 07: with ``PIPELINE_ENABLED=true`` (default false) new jobs also crawl, extract and
+deduplicate (one shared crawler / fetch admission / extractor per process); ``/results`` then
+carries source summaries and dedup groups — never page text.
 """
 
 from __future__ import annotations
@@ -41,16 +45,19 @@ from research_agent.api.schemas import (
 from research_agent.api.service import ResearchService, cancel_http_status
 from research_agent.config import Settings
 from research_agent.core.errors import NoSearchProviderConfiguredError
+from research_agent.crawler import Crawler, CrawlerSettings
 from research_agent.jobs.models import TERMINAL_STATES, JobState, ResearchJobRequest
 from research_agent.jobs.planner import ResearchPlanner
 from research_agent.jobs.repository import InMemoryJobRepository
 from research_agent.jobs.runner import JobRunner
 from research_agent.logging import get_logger
+from research_agent.pipeline.config import PipelineSettings
 from research_agent.pipeline.search import (
     SearchService,
     build_search_service,
     default_search_options,
 )
+from research_agent.pipeline.sources import Pipeline
 from research_agent.providers.search import provider_statuses
 
 log = get_logger(__name__)
@@ -90,9 +97,13 @@ def create_app(
     search_settings: Settings | None = None,
     planner: ResearchPlanner | None = None,
     clock: Callable[[], datetime] | None = None,
+    pipeline_settings: PipelineSettings | None = None,
+    pipeline: Pipeline | None = None,
 ) -> FastAPI:
-    """Build the app. ``search_service``/``planner`` are injectable for tests; by default the
-    Sprint 01 service is built from environment configuration during startup."""
+    """Build the app. ``search_service``/``planner``/``pipeline`` are injectable for tests; by
+    default the Sprint 01 service is built from environment configuration during startup, and the
+    Sprint 07 pipeline only when ``PIPELINE_ENABLED`` is true (a configuration exceeding the text
+    budget fails the startup)."""
     api_settings = settings or ApiSettings()
 
     @asynccontextmanager
@@ -111,10 +122,31 @@ def create_app(
         repository = InMemoryJobRepository()
         runner: JobRunner | None = None
         executor: JobExecutor | None = None
+        owned_crawler: Crawler | None = None
+        job_pipeline = pipeline
+        if job_pipeline is None and service_search is not None:
+            pipe_cfg = pipeline_settings or PipelineSettings()
+            if pipe_cfg.enabled:
+                crawler_cfg = CrawlerSettings()
+                owned_crawler = Crawler(crawler_cfg)
+                try:
+                    job_pipeline = Pipeline.build(
+                        pipe_cfg,
+                        owned_crawler,
+                        crawler_settings=crawler_cfg,
+                        max_concurrent_jobs=api_settings.max_concurrent_jobs,
+                    )
+                except Exception:
+                    await owned_crawler.aclose()
+                    if client is not None:
+                        await client.aclose()
+                    raise
         if service_search is not None:
             runner_kwargs: dict[str, Any] = {}
             if clock is not None:
                 runner_kwargs["clock"] = clock
+            if job_pipeline is not None:
+                runner_kwargs["pipeline"] = job_pipeline
             runner = JobRunner(
                 repository,
                 service_search,
@@ -147,12 +179,15 @@ def create_app(
             max_concurrent_jobs=api_settings.max_concurrent_jobs,
             max_queued_jobs=api_settings.max_queued_jobs,
             search_available=service_search is not None,
+            pipeline_enabled=job_pipeline is not None and job_pipeline.settings.enabled,
         )
         try:
             yield
         finally:
             if executor is not None:
                 await executor.shutdown()
+            if owned_crawler is not None:
+                await owned_crawler.aclose()
             if client is not None:
                 await client.aclose()
 

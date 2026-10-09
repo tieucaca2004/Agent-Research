@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from research_agent.jobs.models import (
     TERMINAL_STATES,
     JobError,
+    JobResult,
+    JobState,
     ResearchJob,
 )
 
@@ -31,6 +33,12 @@ class ProgressView(BaseModel):
     queries_done: int
     queries_failed: int
     results_unique: int
+    # Sprint 07 pipeline jobs (additive; null for Sprint 02 jobs)
+    urls_total: int | None = None
+    urls_done: int | None = None
+    fetch_failed: int | None = None
+    documents: int | None = None
+    groups: int | None = None
 
 
 class ProviderErrorView(BaseModel):
@@ -100,6 +108,43 @@ class QueryOutcomeView(BaseModel):
     result_count: int
 
 
+class SourceSummaryView(BaseModel):
+    """One selected source of a pipeline job. Never page text (decision D9)."""
+
+    position: int
+    url: str
+    providers: list[str]
+    queries: list[str]
+    state: str
+    reason: str | None
+    fetch_status: str | None
+    http_status: int | None
+    final_url: str | None
+    document_id: str | None
+    document_status: str | None
+    document_warnings: list[str]
+    text_chars: int
+    groups: dict[str, str]
+    """Dedup level → group key, for the levels where this source is in a group."""
+
+
+class DuplicateGroupView(BaseModel):
+    level: str
+    key: str
+    representative: int
+    """Source position of the representative (best-ranked member)."""
+    members: list[int]
+    """Source positions, ascending."""
+    warnings: list[str]
+
+
+class DedupSummaryView(BaseModel):
+    documents: int
+    groups: list[DuplicateGroupView]
+    exclusions: int
+    errors: int
+
+
 class ResultsView(BaseModel):
     job_id: str
     status: str
@@ -109,6 +154,9 @@ class ResultsView(BaseModel):
     query_outcomes: list[QueryOutcomeView]
     warnings: list[JobErrorView]
     error: JobErrorView | None
+    # Sprint 07 pipeline jobs (additive; null for Sprint 02 jobs)
+    sources: list[SourceSummaryView] | None = None
+    dedup: DedupSummaryView | None = None
 
 
 def error_view(error: JobError, *, with_provider_errors: bool) -> JobErrorView:
@@ -126,6 +174,10 @@ def error_view(error: JobError, *, with_provider_errors: bool) -> JobErrorView:
     )
 
 
+def _is_pipeline_job(job: ResearchJob) -> bool:
+    return JobState.CRAWLING in job.stages
+
+
 def job_view(job: ResearchJob) -> JobView:
     progress = None
     if job.progress is not None:
@@ -135,6 +187,16 @@ def job_view(job: ResearchJob) -> JobView:
             queries_failed=job.progress.queries_failed,
             results_unique=job.progress.results_unique,
         )
+        if _is_pipeline_job(job):
+            progress = progress.model_copy(
+                update={
+                    "urls_total": job.progress.urls_total,
+                    "urls_done": job.progress.urls_done,
+                    "fetch_failed": job.progress.fetch_failed,
+                    "documents": job.progress.documents,
+                    "groups": job.progress.groups,
+                }
+            )
     summary = None
     if job.result is not None and job.status in TERMINAL_STATES:
         response = job.result.response
@@ -200,6 +262,62 @@ def results_view(job: ResearchJob) -> ResultsView:
         ],
         warnings=[error_view(w, with_provider_errors=True) for w in job.warnings],
         error=error_view(job.error, with_provider_errors=True) if job.error else None,
+        sources=_source_views(result) if _is_pipeline_job(job) else None,
+        dedup=_dedup_view(result) if _is_pipeline_job(job) else None,
+    )
+
+
+def _source_views(result: JobResult | None) -> list[SourceSummaryView]:
+    if result is None:
+        return []
+    membership: dict[int, dict[str, str]] = {}
+    if result.dedup is not None:
+        positions = result.dedup.positions
+        for level, groups in result.dedup.result.groups.items():
+            for group in groups:
+                for member in group.members:
+                    membership.setdefault(positions[member], {})[level.value] = group.key
+    return [
+        SourceSummaryView(
+            position=s.position,
+            url=s.url,
+            providers=list(s.providers),
+            queries=list(s.queries),
+            state=s.state,
+            reason=s.reason,
+            fetch_status=s.fetch.status.value if s.fetch else None,
+            http_status=s.fetch.http_status if s.fetch else None,
+            final_url=s.fetch.final_url if s.fetch else None,
+            document_id=s.document_id,
+            document_status=s.document_status.value if s.document_status else None,
+            document_warnings=[w.value for w in s.document_warnings],
+            text_chars=s.text_chars,
+            groups=membership.get(s.position, {}),
+        )
+        for s in result.sources
+    ]
+
+
+def _dedup_view(result: JobResult | None) -> DedupSummaryView | None:
+    if result is None or result.dedup is None:
+        return None
+    positions = result.dedup.positions
+    document_set = result.dedup.result
+    return DedupSummaryView(
+        documents=document_set.stats.documents,
+        groups=[
+            DuplicateGroupView(
+                level=level.value,
+                key=group.key,
+                representative=positions[group.representative],
+                members=[positions[m] for m in group.members],
+                warnings=[w.value for w in group.warnings],
+            )
+            for level, groups in document_set.groups.items()
+            for group in groups
+        ],
+        exclusions=document_set.stats.exclusions,
+        errors=document_set.stats.errors,
     )
 
 

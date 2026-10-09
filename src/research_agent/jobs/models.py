@@ -14,6 +14,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from research_agent.core.models import SearchOptions, SearchResponse
+from research_agent.extraction.models import ExtractedDocument
+from research_agent.pipeline.models import CrawlStats, DedupRecord, SourceRecord, StageOutcome
 
 
 class JobState(StrEnum):
@@ -46,6 +48,15 @@ TERMINAL_STATES: frozenset[JobState] = frozenset(
 
 SPRINT_02_STAGES: tuple[JobState, ...] = (JobState.PLANNING, JobState.SEARCHING)
 """Stages executed by Sprint 02 jobs. Later sprints append CRAWLING … VERIFYING."""
+
+PIPELINE_STAGES: tuple[JobState, ...] = (
+    JobState.PLANNING,
+    JobState.SEARCHING,
+    JobState.CRAWLING,
+    JobState.NORMALIZING,
+)
+"""Sprint 07 pipeline jobs (feature flag, default off): CRAWLING = S04 fetch + S05 content
+extraction, NORMALIZING = S06 grouping. EXTRACTING (AI extraction) is not configured."""
 
 
 class ResearchJobRequest(BaseModel):
@@ -137,6 +148,16 @@ JobErrorCode = Literal[
     "CANCELLED",
     "RUNNER_INTERRUPTED",
     "INTERNAL_ERROR",
+    # Sprint 07 pipeline (additive)
+    "CRAWL_STAGE_TIMEOUT",
+    "FETCH_FAILURES",
+    "EXTRACTION_DEGRADED",
+    "NO_DOCUMENTS",
+    "CRAWL_FAILED",
+    "EXTRACTION_FAILED",
+    "DEDUP_FAILED",
+    "DEDUP_CONTRACT_ERRORS",
+    "PIPELINE_BUDGET_EXCEEDED",
 ]
 
 
@@ -151,6 +172,17 @@ class JobError(BaseModel):
     CANCELLED                   CANCELLED         cancellation was requested
     RUNNER_INTERRUPTED          INTERNAL_ERROR    the runner task itself was cancelled
     INTERNAL_ERROR              INTERNAL_ERROR    unexpected exception (type name only)
+
+    Sprint 07 pipeline jobs:
+    CRAWL_STAGE_TIMEOUT         TIMEOUT           CRAWLING exceeded its stage timeout (warning)
+    FETCH_FAILURES              FETCH_ERROR       some sources were not fetched (warning)
+    EXTRACTION_DEGRADED         EXTRACTION_ERROR  some documents are not SUCCESS (warning)
+    NO_DOCUMENTS                FETCH_ERROR       sources selected, no usable document
+    CRAWL_FAILED                INTERNAL_ERROR    unexpected exception / join mismatch, fetch side
+    EXTRACTION_FAILED           INTERNAL_ERROR    unexpected exception / join mismatch, extraction
+    DEDUP_FAILED                INTERNAL_ERROR    S06 raised
+    DEDUP_CONTRACT_ERRORS       INTERNAL_ERROR    S06 reported per-document errors (warning)
+    PIPELINE_BUDGET_EXCEEDED    INTERNAL_ERROR    extracted text exceeded the job budget
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -176,6 +208,12 @@ class JobProgress(BaseModel):
     queries_done: int = Field(default=0, ge=0)
     queries_failed: int = Field(default=0, ge=0)
     results_unique: int = Field(default=0, ge=0)
+    # Sprint 07 pipeline jobs (additive; 0 for Sprint 02 jobs)
+    urls_total: int = Field(default=0, ge=0)
+    urls_done: int = Field(default=0, ge=0)
+    fetch_failed: int = Field(default=0, ge=0)
+    documents: int = Field(default=0, ge=0)
+    groups: int = Field(default=0, ge=0)
 
 
 class JobResult(BaseModel):
@@ -187,6 +225,15 @@ class JobResult(BaseModel):
     response: SearchResponse | None = None
     """Merged Sprint 01 ``SearchResponse`` over all covered queries (None if none covered)."""
     coverage: Coverage = "NONE"
+    # Sprint 07 pipeline jobs (additive; empty for Sprint 02 jobs)
+    sources: list[SourceRecord] = Field(default_factory=list)
+    """Selected sources in canonical order (position = index in ``response.results``)."""
+    not_selected: int = Field(default=0, ge=0)
+    documents: list[ExtractedDocument] = Field(default_factory=list)
+    """Extracted documents in ascending source position (= S06 input order)."""
+    dedup: DedupRecord | None = None
+    crawl_stats: CrawlStats | None = None
+    stage_outcomes: list[StageOutcome] = Field(default_factory=list)
 
 
 class ResearchJob(BaseModel):

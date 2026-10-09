@@ -18,6 +18,14 @@ runner tells a job cancel apart from its own task being cancelled via
 
 There is no job-level retry: a job runs at most once (claim is compare-and-set). Re-running a
 research means creating a new job.
+
+Sprint 07 (additive, feature flag ``PIPELINE_ENABLED``, default off): with a ``Pipeline``
+configured, new jobs run ``PLANNING → SEARCHING → CRAWLING → NORMALIZING`` (S04 fetch + S05
+extraction in CRAWLING, S06 grouping in NORMALIZING; docs/sprint-07-pipeline-integration-design.md).
+Without it, every Sprint 02 path below is unchanged. The new stages reuse the same race rules
+(``_save_update``, terminal checks before starting work, captured results never discarded); for
+them a recorded cancellation wins over a stage error (decision OD-B = B2), while PLANNING and
+SEARCHING keep their Sprint 02 semantics.
 """
 
 from __future__ import annotations
@@ -26,15 +34,18 @@ import asyncio
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
 from research_agent.core.errors import AllSearchProvidersFailedError
 from research_agent.core.models import SearchOptions
+from research_agent.extraction.models import ExtractionStatus
 from research_agent.jobs.errors import JobVersionConflictError
 from research_agent.jobs.models import (
+    PIPELINE_STAGES,
     SPRINT_02_STAGES,
     AttemptRecord,
     Coverage,
@@ -52,7 +63,16 @@ from research_agent.jobs.models import (
 from research_agent.jobs.planner import FixedPlanner, ResearchPlanner
 from research_agent.jobs.repository import JobRepository
 from research_agent.logging import get_logger
+from research_agent.pipeline.discovery import select_sources
+from research_agent.pipeline.models import DedupRecord, StageOutcome, StageStatus
 from research_agent.pipeline.search import SearchAttempt, SearchRun, SearchService, query_hash
+from research_agent.pipeline.sources import (
+    Pipeline,
+    SourceCapture,
+    StageFailure,
+    collect_sources,
+    usable_documents,
+)
 
 log = get_logger(__name__)
 
@@ -78,6 +98,29 @@ class _JobFinalized(Exception):
 
 
 @dataclass
+class _PipelineState:
+    """Per-run state of a pipeline job (Sprint 07), carried across its stages."""
+
+    search_result: JobResult | None = None
+    crawl_result: JobResult | None = None
+    capture: SourceCapture | None = None
+    warnings: list[JobError] = field(default_factory=list)
+    degraded: bool = False
+    """Some planned work was not covered (search coverage, stage timeout): best status PARTIAL."""
+    crawl_outcome: StageOutcome | None = None
+
+
+_DEGRADED_EXTRACTION = frozenset(
+    {
+        ExtractionStatus.PARTIAL,
+        ExtractionStatus.EMPTY,
+        ExtractionStatus.UNSUPPORTED,
+        ExtractionStatus.FAILED,
+    }
+)
+
+
+@dataclass
 class _SearchCapture:
     outcomes: list[QueryOutcome]
     runs: list[SearchRun]
@@ -98,6 +141,7 @@ class JobRunner:
         search_stage_timeout_s: float = 300.0,
         worker_id: str | None = None,
         clock: Clock = _utcnow,
+        pipeline: Pipeline | None = None,
     ) -> None:
         if job_timeout_s <= 0 or search_stage_timeout_s <= 0:
             raise ValueError("timeouts must be positive")
@@ -109,12 +153,18 @@ class JobRunner:
         self._stage_timeout_s = search_stage_timeout_s
         self._worker_id = worker_id or f"runner-{uuid.uuid4().hex[:8]}"
         self._clock = clock
-        self._inflight: dict[str, asyncio.Task[SearchRun]] = {}
+        self._inflight: dict[str, asyncio.Task[Any]] = {}
+        self._pipeline = pipeline if pipeline is not None and pipeline.settings.enabled else None
+        self._stages = SPRINT_02_STAGES if self._pipeline is None else PIPELINE_STAGES
+        self._pipeline_states: dict[str, _PipelineState] = {}
 
     # -- public API ---------------------------------------------------------------------
 
     async def submit(self, request: ResearchJobRequest) -> tuple[ResearchJob, bool]:
-        job, created = await self._repo.create(request, now=self._clock())
+        if self._stages == SPRINT_02_STAGES:
+            job, created = await self._repo.create(request, now=self._clock())
+        else:
+            job, created = await self._repo.create(request, now=self._clock(), stages=self._stages)
         with structlog.contextvars.bound_contextvars(job_id=job.id):
             log.info(
                 "job.created" if created else "job.idempotent_hit",
@@ -140,7 +190,8 @@ class JobRunner:
         """
         with structlog.contextvars.bound_contextvars(job_id=job_id):
             current = await self._repo.get(job_id)
-            if current.stages != SPRINT_02_STAGES:
+            supported = (SPRINT_02_STAGES,) if self._pipeline is None else self._supported
+            if current.stages not in supported:
                 raise ValueError(
                     f"runner supports stages {[s.value for s in SPRINT_02_STAGES]}, "
                     f"job has {[s.value for s in current.stages]}"
@@ -157,11 +208,35 @@ class JobRunner:
 
     # -- pipeline -----------------------------------------------------------------------
 
+    _supported = (SPRINT_02_STAGES, PIPELINE_STAGES)
+
     async def _execute(self, job: ResearchJob) -> ResearchJob:
         job = await self._planning(job)
         if job.is_terminal:
             return job
-        return await self._searching(job)
+        if not self._is_pipeline(job):
+            return await self._searching(job)
+        state = _PipelineState()
+        self._pipeline_states[job.id] = state
+        try:
+            job = await self._searching(job)
+            if job.is_terminal:
+                return job
+            job = await self._enter_stage(job, JobState.CRAWLING, state, state.search_result)
+            if job.is_terminal:
+                return job
+            job = await self._crawling(job, state)
+            if job.is_terminal:
+                return job
+            job = await self._enter_stage(job, JobState.NORMALIZING, state, state.crawl_result)
+            if job.is_terminal:
+                return job
+            return await self._normalizing(job, state)
+        finally:
+            self._pipeline_states.pop(job.id, None)
+
+    def _is_pipeline(self, job: ResearchJob) -> bool:
+        return self._pipeline is not None and job.stages == PIPELINE_STAGES
 
     async def _planning(self, job: ResearchJob) -> ResearchJob:
         log.info("job.stage_started", stage=JobState.PLANNING.value)
@@ -259,6 +334,8 @@ class JobRunner:
         if job.is_terminal:  # only another writer can have finalized it: its state is final
             log.warning("job.finalized_elsewhere", status=job.status.value)
             return job
+        if self._is_pipeline(job):
+            return await self._conclude_search(job, plan, capture)
         return await self._conclude(job, plan, capture)
 
     async def _run_queries(
@@ -512,6 +589,7 @@ class JobRunner:
                     ),
                     queries_failed=sum(1 for o in result.outcomes if o.status == "FAILED"),
                     results_unique=len(result.response.results) if result.response else 0,
+                    **_pipeline_counts(result),
                 )
         event = {
             JobState.COMPLETED: "job.completed",
@@ -559,6 +637,418 @@ class JobRunner:
                 category="INTERNAL_ERROR",
             ),
         )
+
+    # -- pipeline stages (Sprint 07; only for jobs with PIPELINE_STAGES) ------------------
+
+    async def _conclude_search(
+        self, job: ResearchJob, plan: ResearchPlan, capture: _SearchCapture
+    ) -> ResearchJob:
+        """End of SEARCHING for a pipeline job. Cancel and "nothing covered" end the job by the
+        Sprint 02 rules; a job deadline with ≥ 1 covered query ends it PARTIAL (row 4a, through
+        ``_finish_partial``); otherwise the job continues (a search-stage timeout or incomplete
+        coverage only makes its best final status PARTIAL)."""
+        state = self._pipeline_states[job.id]
+        if job.cancel_requested:
+            capture.stop = "CANCELLED"
+        result = self._result(job, plan, capture)
+        covered = sum(1 for o in result.outcomes if o.status == "COVERED")
+        if capture.stop == "CANCELLED" or not covered:
+            return await self._conclude(job, plan, capture)  # CANCELLED / FAILED: Sprint 02 rules
+        if capture.stop == "JOB_DEADLINE_EXCEEDED":  # ≥ 1 query covered → PARTIAL (row 4a)
+            return await self._finish_deadline(job, state, result)
+        step = JobState.SEARCHING
+        if capture.stop == "SEARCH_STAGE_TIMEOUT":
+            state.warnings.append(
+                self._error(
+                    "SEARCH_STAGE_TIMEOUT",
+                    step,
+                    "search stage timeout",
+                    provider_errors=_provider_errors(result.outcomes),
+                )
+            )
+            state.degraded = True
+        elif _provider_errors(result.outcomes):
+            state.warnings.append(
+                self._error(
+                    "PROVIDER_FAILURES",
+                    step,
+                    "some provider calls failed",
+                    provider_errors=_provider_errors(result.outcomes),
+                    category="PROVIDER_ERROR",
+                )
+            )
+        if covered < len(plan.queries):
+            state.degraded = True
+        state.search_result = result
+        return job
+
+    async def _enter_stage(
+        self, job: ResearchJob, stage: JobState, state: _PipelineState, result: JobResult | None
+    ) -> ResearchJob:
+        """Pipeline stage boundary: terminal → as stored; cancel → CANCELLED (B2); job deadline →
+        PARTIAL/FAILED with what was captured; otherwise transition to ``stage``."""
+        latest = await self._repo.get(job.id)
+        if latest.is_terminal:
+            log.warning("job.finalized_elsewhere", status=latest.status.value)
+            return latest
+        if latest.cancel_requested:
+            return await self._finish(
+                latest, JobState.CANCELLED, result=result, warnings=state.warnings
+            )
+        if self._seconds_left(latest) <= 0:
+            return await self._finish_deadline(latest, state, result)
+        try:
+            return await self._save_update(
+                latest,
+                {
+                    "status": stage,
+                    "updated_at": self._clock(),
+                    "result": result,
+                    "progress": self._pipeline_progress(latest, stage, result),
+                },
+            )
+        except _JobCancelled:
+            return await self._finish(
+                await self._repo.get(job.id),
+                JobState.CANCELLED,
+                result=result,
+                warnings=state.warnings,
+            )
+
+    async def _finish_deadline(
+        self, job: ResearchJob, state: _PipelineState, result: JobResult | None
+    ) -> ResearchJob:
+        """Job deadline in or after a pipeline stage: PARTIAL if something useful was captured
+        (≥ 1 usable document after CRAWLING started, ≥ 1 covered query before), else FAILED."""
+        step = job.status
+        error = self._error("JOB_DEADLINE_EXCEEDED", step, "job deadline exceeded")
+        if step is JobState.SEARCHING:
+            useful = result is not None and any(o.status == "COVERED" for o in result.outcomes)
+        else:
+            useful = result is not None and usable_documents(result.documents) > 0
+        if useful:
+            return await self._finish_partial(job, state, result, warnings=[*state.warnings, error])
+        return await self._finish(
+            job, JobState.FAILED, result=result, error=error, warnings=state.warnings
+        )
+
+    async def _finish_partial(
+        self,
+        job: ResearchJob,
+        state: _PipelineState,
+        result: JobResult | None,
+        *,
+        warnings: list[JobError],
+    ) -> ResearchJob:
+        """PARTIAL before the last configured stage. The frozen state machine allows PARTIAL only
+        from the last stage, so the remaining stages are entered without running them (their
+        outcome is recorded as NOT_RUN), each through ``_save_update`` like any other write."""
+        skipped = job.stages[job.stages.index(job.status) + 1 :]
+        if result is not None:
+            outcomes = list(result.stage_outcomes)
+            if state.crawl_outcome is None and JobState.CRAWLING in skipped:
+                outcomes.append(StageOutcome(stage="CRAWLING", status="NOT_RUN"))
+            if JobState.NORMALIZING in skipped:
+                outcomes.append(StageOutcome(stage="NORMALIZING", status="NOT_RUN"))
+            result = result.model_copy(update={"stage_outcomes": outcomes})
+        for stage in skipped:
+            try:
+                job = await self._save_update(
+                    job, {"status": stage, "updated_at": self._clock(), "result": result}
+                )
+            except _JobCancelled:
+                return await self._finish(
+                    await self._repo.get(job.id),
+                    JobState.CANCELLED,
+                    result=result,
+                    warnings=state.warnings,
+                )
+            if job.is_terminal:
+                return job
+        return await self._finish(job, JobState.PARTIAL, result=result, warnings=warnings)
+
+    async def _crawling(self, job: ResearchJob, state: _PipelineState) -> ResearchJob:
+        pipeline = self._pipeline
+        if pipeline is None or state.search_result is None:  # guarded by _is_pipeline
+            raise RuntimeError("CRAWLING entered without a pipeline or search result")
+        settings = pipeline.settings
+        selection = select_sources(state.search_result.response, settings.max_urls)
+        capture = SourceCapture(selection)
+        state.capture = capture
+        seconds_left = self._seconds_left(job)
+        limit_code: JobErrorCode
+        if seconds_left <= settings.crawl_stage_timeout_s:
+            limit, limit_code = seconds_left, "JOB_DEADLINE_EXCEEDED"
+        else:
+            limit, limit_code = settings.crawl_stage_timeout_s, "CRAWL_STAGE_TIMEOUT"
+        deadline = asyncio.get_running_loop().time() + max(limit, 0.0)
+        log.info(
+            "job.stage_started",
+            stage=JobState.CRAWLING.value,
+            sources=len(selection.sources),
+            not_selected=selection.not_selected,
+        )
+        started = time.monotonic()
+        save_lock = asyncio.Lock()
+
+        async def before_fetch() -> None:
+            latest = await self._repo.get(job.id)
+            if latest.is_terminal:
+                raise _JobFinalized
+            if latest.cancel_requested:
+                raise _JobCancelled
+
+        async def on_capture() -> None:
+            async with save_lock:  # serialized: the stored snapshot is always the newest
+                latest = await self._repo.get(job.id)
+                snapshot = self._crawl_result(state, None)
+                await self._save_update(
+                    latest,
+                    {
+                        "updated_at": self._clock(),
+                        "result": snapshot,
+                        "progress": self._pipeline_progress(latest, JobState.CRAWLING, snapshot),
+                    },
+                    event="job.crawl.source_captured",
+                    data={
+                        "fetched": sum(1 for f in capture.fetches if f is not None),
+                        "extracted": sum(1 for d in capture.documents if d is not None),
+                    },
+                )
+
+        task = asyncio.create_task(
+            collect_sources(
+                pipeline,
+                capture,
+                job_id=job.id,
+                deadline=deadline,
+                before_fetch=before_fetch,
+                on_capture=on_capture,
+            )
+        )
+        self._inflight[job.id] = task
+        stage_error: StageFailure | None = None
+        try:
+            latest = await self._repo.get(job.id)
+            if latest.is_terminal or latest.cancel_requested:
+                task.cancel()  # nothing is fetched for a job already finished or cancelled
+            await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if not (task.cancelled() and current is not None and current.cancelling() == 0):
+                raise  # the runner task itself is being cancelled: RUNNER_INTERRUPTED
+            capture.stop_reason = "CANCELLED"
+        except _JobFinalized:
+            capture.stop_reason = "FINALIZED"
+        except _JobCancelled:
+            capture.stop_reason = "CANCELLED"
+        except StageFailure as exc:
+            stage_error = exc
+            capture.stop_reason = "STAGE_FAILED"
+        except Exception as exc:
+            stage_error = StageFailure("CRAWL_FAILED", f"crawl stage raised {type(exc).__name__}")
+            capture.stop_reason = "STAGE_FAILED"
+        finally:
+            self._inflight.pop(job.id, None)
+            if not task.done():
+                task.cancel()
+                await asyncio.wait({task})
+        if capture.stop_reason is None and capture.deadline_hit:
+            capture.stop_reason = (
+                "JOB_DEADLINE" if limit_code == "JOB_DEADLINE_EXCEEDED" else "STAGE_TIMEOUT"
+            )
+        outcome = _crawl_outcome(capture.stop_reason, stage_error, limit_code)
+        state.crawl_outcome = outcome
+        result = self._crawl_result(state, None)
+        log.info(
+            "job.stage_finished",
+            stage=JobState.CRAWLING.value,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            stopped_by=capture.stop_reason,
+            **capture.stats().model_dump(
+                exclude={"fetch_status_counts", "extraction_status_counts"}
+            ),
+        )
+        latest = await self._repo.get(job.id)
+        if latest.is_terminal:
+            log.warning("job.finalized_elsewhere", status=latest.status.value)
+            return latest
+        if latest.cancel_requested:  # B2: a recorded cancel wins over a stage error
+            warnings = list(state.warnings)
+            if stage_error is not None:
+                warnings.append(
+                    self._error(stage_error.code, JobState.CRAWLING, stage_error.message)
+                )
+            return await self._finish(latest, JobState.CANCELLED, result=result, warnings=warnings)
+        if stage_error is not None:
+            return await self._finish(
+                latest,
+                JobState.FAILED,
+                result=result,
+                error=self._error(stage_error.code, JobState.CRAWLING, stage_error.message),
+                warnings=state.warnings,
+            )
+        if capture.stop_reason == "JOB_DEADLINE":
+            return await self._finish_deadline(latest, state, result)
+        if capture.stop_reason == "STAGE_TIMEOUT":
+            state.warnings.append(
+                self._error("CRAWL_STAGE_TIMEOUT", JobState.CRAWLING, "crawl stage timeout")
+            )
+            state.degraded = True
+        state.crawl_result = result
+        return latest
+
+    async def _normalizing(self, job: ResearchJob, state: _PipelineState) -> ResearchJob:
+        pipeline = self._pipeline
+        capture = state.capture
+        if pipeline is None or capture is None:  # guarded by _execute
+            raise RuntimeError("NORMALIZING entered without a crawl")
+        documents, positions = capture.documents_in_order()
+        log.info("job.stage_started", stage=JobState.NORMALIZING.value, documents=len(documents))
+        started = time.monotonic()
+        task = asyncio.ensure_future(asyncio.to_thread(pipeline.deduplicate, documents))
+        self._inflight[job.id] = task
+        document_set = None
+        stage_error: StageFailure | None = None
+        try:
+            latest = await self._repo.get(job.id)
+            if latest.is_terminal or latest.cancel_requested:
+                task.cancel()
+            document_set = await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if not (task.cancelled() and current is not None and current.cancelling() == 0):
+                raise
+        except Exception as exc:
+            stage_error = StageFailure("DEDUP_FAILED", f"deduplication raised {type(exc).__name__}")
+        finally:
+            self._inflight.pop(job.id, None)
+            if not task.done():
+                task.cancel()  # S06 is pure: an abandoned worker thread has no side effect
+        dedup = (
+            None if document_set is None else DedupRecord(positions=positions, result=document_set)
+        )
+        outcome = StageOutcome(
+            stage="NORMALIZING",
+            status="FAILED" if stage_error else "COMPLETED" if dedup else "INTERRUPTED",
+            code=stage_error.code if stage_error else None,
+        )
+        result = self._crawl_result(state, dedup, outcome)
+        log.info(
+            "job.stage_finished",
+            stage=JobState.NORMALIZING.value,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            documents=len(documents),
+            groups={k.value: v for k, v in document_set.stats.groups.items()}
+            if document_set
+            else None,
+            stopped_by=outcome.status if outcome.status != "COMPLETED" else None,
+        )
+        latest = await self._repo.get(job.id)
+        if latest.is_terminal:
+            log.warning("job.finalized_elsewhere", status=latest.status.value)
+            return latest
+        if latest.cancel_requested:  # B2
+            warnings = list(state.warnings)
+            if stage_error is not None:
+                warnings.append(
+                    self._error("DEDUP_FAILED", JobState.NORMALIZING, stage_error.message)
+                )
+            return await self._finish(latest, JobState.CANCELLED, result=result, warnings=warnings)
+        if stage_error is not None or dedup is None:
+            return await self._finish(
+                latest,
+                JobState.FAILED,
+                result=result,
+                error=self._error(
+                    "DEDUP_FAILED",
+                    JobState.NORMALIZING,
+                    stage_error.message if stage_error else "deduplication did not complete",
+                ),
+                warnings=state.warnings,
+            )
+        return await self._conclude_pipeline(latest, state, result, dedup)
+
+    async def _conclude_pipeline(
+        self, job: ResearchJob, state: _PipelineState, result: JobResult, dedup: DedupRecord
+    ) -> ResearchJob:
+        """Final status after NORMALIZING (design §10.2 rows 7-9)."""
+        stats = result.crawl_stats
+        warnings = list(state.warnings)
+        if stats is not None and stats.fetch_failed:
+            warnings.append(
+                self._error("FETCH_FAILURES", JobState.CRAWLING, "some sources were not fetched")
+            )
+        if any(d.status in _DEGRADED_EXTRACTION for d in result.documents):
+            warnings.append(
+                self._error(
+                    "EXTRACTION_DEGRADED",
+                    JobState.CRAWLING,
+                    "some documents were not fully extracted",
+                )
+            )
+        if dedup.result.errors:
+            warnings.append(
+                self._error(
+                    "DEDUP_CONTRACT_ERRORS",
+                    JobState.NORMALIZING,
+                    "deduplication reported document errors",
+                )
+            )
+        if result.sources and usable_documents(result.documents) == 0:
+            return await self._finish(
+                job,
+                JobState.FAILED,
+                result=result,
+                error=self._error(
+                    "NO_DOCUMENTS", JobState.CRAWLING, "no usable document was obtained"
+                ),
+                warnings=warnings,
+            )
+        status = JobState.PARTIAL if state.degraded else JobState.COMPLETED
+        return await self._finish(job, status, result=result, warnings=warnings)
+
+    def _crawl_result(
+        self,
+        state: _PipelineState,
+        dedup: DedupRecord | None,
+        normalizing: StageOutcome | None = None,
+    ) -> JobResult:
+        base = state.search_result or JobResult()
+        capture = state.capture
+        if capture is None:
+            return base
+        documents, _ = capture.documents_in_order()
+        outcomes = [o for o in (state.crawl_outcome, normalizing) if o is not None]
+        return base.model_copy(
+            update={
+                "sources": capture.records(),
+                "not_selected": capture.selection.not_selected,
+                "documents": documents,
+                "dedup": dedup,
+                "crawl_stats": capture.stats(),
+                "stage_outcomes": outcomes,
+            }
+        )
+
+    def _pipeline_progress(
+        self, job: ResearchJob, stage: JobState, result: JobResult | None
+    ) -> JobProgress:
+        plan = job.plan
+        response = result.response if result is not None else None
+        outcomes = result.outcomes if result is not None else []
+        base = JobProgress(
+            stage=stage,
+            stage_index=job.stages.index(stage),
+            total_stages=len(job.stages),
+            queries_total=len(plan.queries) if plan is not None else 0,
+            queries_done=sum(1 for o in outcomes if o.status in ("COVERED", "FAILED")),
+            queries_failed=sum(1 for o in outcomes if o.status == "FAILED"),
+            results_unique=len(response.results) if response is not None else 0,
+        )
+        if result is None:
+            return base
+        return base.model_copy(update=_pipeline_counts(result))
 
     # -- helpers ------------------------------------------------------------------------
 
@@ -624,6 +1114,10 @@ class JobRunner:
             "SEARCH_STAGE_TIMEOUT": "TIMEOUT",
             "JOB_DEADLINE_EXCEEDED": "TIMEOUT",
             "CANCELLED": "CANCELLED",
+            "CRAWL_STAGE_TIMEOUT": "TIMEOUT",
+            "FETCH_FAILURES": "FETCH_ERROR",
+            "NO_DOCUMENTS": "FETCH_ERROR",
+            "EXTRACTION_DEGRADED": "EXTRACTION_ERROR",
         }.get(code, "INTERNAL_ERROR")
         return JobError(
             code=code,
@@ -674,3 +1168,38 @@ def _provider_errors(outcomes: list[QueryOutcome]) -> list[ProviderErrorRecord]:
         for record in records:
             seen.setdefault((record.provider, record.code, record.category), record)
     return list(seen.values())
+
+
+def _pipeline_counts(result: JobResult) -> dict[str, int]:
+    """Pipeline progress counts; empty for Sprint 02 results (their progress is unchanged)."""
+    if result.crawl_stats is None:
+        return {}
+    stats = result.crawl_stats
+    groups = 0
+    if result.dedup is not None:
+        groups = sum(result.dedup.result.stats.groups.values())
+    return {
+        "urls_total": stats.selected,
+        "urls_done": stats.fetched,
+        "fetch_failed": stats.fetch_failed,
+        "documents": stats.extracted,
+        "groups": groups,
+    }
+
+
+def _crawl_outcome(
+    stop: str | None, stage_error: StageFailure | None, limit_code: str
+) -> StageOutcome:
+    status: StageStatus
+    code: str | None = None
+    if stage_error is not None:
+        status, code = "FAILED", stage_error.code
+    elif stop in ("CANCELLED", "FINALIZED"):
+        status = "INTERRUPTED"
+    elif stop == "JOB_DEADLINE":
+        status, code = "INTERRUPTED", limit_code
+    elif stop == "STAGE_TIMEOUT":
+        status, code = "PARTIAL", limit_code
+    else:
+        status = "COMPLETED"
+    return StageOutcome(stage="CRAWLING", status=status, code=code)

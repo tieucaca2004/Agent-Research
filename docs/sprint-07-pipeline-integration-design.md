@@ -1,6 +1,7 @@
 # Sprint 07 — Pipeline integration: Search → Crawler → Extraction → Dedup (design)
 
-Status: **DESIGN — decisions locked by the founder's decision-lock brief on `39e23dc`; not implemented.**
+Status: **IMPLEMENTED behind `PIPELINE_ENABLED` (default off)** — decisions locked on `39e23dc`/`12dadc7`;
+founder decisions OD-A = A1, OD-B = B2, OD-C granted, X-1 unchanged. As-built record and evidence: §19.
 No production code, test, dependency or ARCHITECTURE change in this or the previous design turn.
 §0 is the authoritative decision register; where older wording elsewhere differs, §0 prevails.
 
@@ -517,3 +518,101 @@ written, not run); **E2E** = requires the implementation. No ADD/E2E test is cla
 9. Mutation (§15) reported mutant by mutant; no unexplained survivor.
 10. Gates: full regression, ruff, mypy strict, bandit, pip-audit, secret scan, `git diff --check`; no new dependency.
 11. Opt-in live pipeline test passes only with real fetched documents, or is reported as not run.
+
+## 19. Implementation status and evidence (as built)
+
+Founder decisions applied: **OD-A = A1** (admission control, S04 residual accepted and measured, S04 not
+reopened), **OD-B = B2** (in CRAWLING/NORMALIZING a recorded cancel wins over a stage error; PLANNING/SEARCHING
+unchanged), **OD-C** (additive changes to `jobs/runner.py`, `jobs/models.py`, `api/app.py`, `api/schemas.py`),
+**X-1** (roadmap numbering unchanged). Baseline before the change: `12dadc7` (code = `75ce79e`), 845 passed /
+5 skipped.
+
+**Files.** New: `pipeline/config.py` (`PipelineSettings`, prefix `PIPELINE_`, `enabled=False`, `max_urls ≤ 30`,
+`max_total_text_chars ≤ 30 000 000`, static check), `pipeline/models.py` (`FetchRecord`, `SourceRecord`,
+`DedupRecord`, `StageOutcome`, `CrawlStats`), `pipeline/discovery.py` (`select_sources`), `pipeline/admission.py`
+(`FetchAdmission`, `BodyBudget`), `pipeline/sources.py` (`Pipeline`, `SourceCapture`, `collect_sources`,
+`StageFailure`). Additive: `jobs/models.py` (`PIPELINE_STAGES`, 9 error codes, `JobResult`/`JobProgress` fields),
+`jobs/runner.py` (`pipeline=` parameter; new `_conclude_search`, `_enter_stage`, `_finish_deadline`,
+`_finish_partial`, `_crawling`, `_normalizing`, `_conclude_pipeline`; `_finish` adds pipeline counts — empty for
+Sprint 02 results), `api/app.py` (one shared crawler/admission/extractor when enabled; closed on shutdown),
+`api/schemas.py` (`ResultsView.sources/dedup`, `ProgressView` counts — `null` for Sprint 02 jobs). Not changed:
+S01, S04, S05, S06 code, `jobs/state_machine.py`, `jobs/repository.py`, `api/config.py`, dependencies,
+ARCHITECTURE.md, every existing test.
+
+**As-built deviations from the design text (reported, no decision changed).**
+
+| # | Design text | As built | Reason / evidence |
+|---|---|---|---|
+| B-1 | §10.2 rows 4a/4b: "PARTIAL … NORMALIZING `NOT_RUN`" | before PARTIAL, the remaining configured stages are **entered without running** (`_finish_partial`: transitions through `_save_update`, outcome `NOT_RUN`, no dedup), so the state path shows e.g. `CRAWLING → NORMALIZING → PARTIAL` | the frozen state machine (`jobs/state_machine.py`, not in OD-C) allows `PARTIAL`/`COMPLETED` only from the last configured stage; `CRAWLING → PARTIAL` raised `InvalidJobTransitionError` in the first test run. Covered by tests (row 4a, 4b, clock-skew case, cancel on a skip transition) and mutant M24 |
+| B-2 | §12.1: re-read the job before each admission | re-read **after the admission grant, immediately before each fetch** (`before_fetch`), plus one read before the stage task runs | the read closest to the fetch is the one that guarantees "no fetch after a terminal state / cancel"; the pre-start read keeps a cancelled job from taking shared slots (mutants M18, M19) |
+| B-3 | §8.2: backlog ≤ 4 waiting bodies | one `BodyBudget` per process, capacity = global fetches + backlog + extraction concurrency (5 + 4 + 2 = 11), taken after admission and released after extraction | a body is counted from fetch to end of extraction; measured `bodies_max_held` = 10 in the benchmarks |
+| B-4 | categories not fixed | `FETCH_FAILURES`/`NO_DOCUMENTS` → `FETCH_ERROR`, `EXTRACTION_DEGRADED` → `EXTRACTION_ERROR`, `CRAWL_STAGE_TIMEOUT` → `TIMEOUT`, stage errors and `DEDUP_CONTRACT_ERRORS` → `INTERNAL_ERROR` | documented in `JobError` |
+| B-5 | B2 | when a cancel wins over a stage error, the stage error is kept as a **warning** of the `CANCELLED` job | the exception stays visible |
+| B-6 | §6 lists `api/config.py` | unchanged; the flag is `PIPELINE_ENABLED` in `PipelineSettings` | separate settings class, as for S04/S05 |
+
+**Defects found and fixed during implementation (new S07 code, before commit).** (1) `FetchAdmission` granted a
+slot to a waiter whose task had been cancelled while queued (asyncio cancels the awaited future before the
+coroutine runs again) → `InvalidStateError` and a leaked slot; found by the seeded randomized test (A11, seed 2),
+fixed by dropping done futures before granting; mutant M05. (2) Timeout classification ignored the redirect
+`Location` (S04 records no final URL on a timeout), so P7 residuals were counted as "other"; found by A8, fixed;
+mutant M30. Test-harness corrections (not product code): benchmark body sized by UTF-8 bytes (was over the 5 MiB
+cap), more test hosts, one racy test expectation.
+
+**Tests.** 76 new tests: unit admission 9, unit pipeline 9, integration E2E 42, admission A2–A10 7, API 5,
+benchmark 4 (+ 1 opt-in live). Full suite: **921 passed, 6 skipped** (skips: 4 `live_network` without
+`RUN_LIVE_NETWORK=1`, 2 live search without API keys). No existing test was edited.
+
+| Area | Evidence |
+|---|---|
+| OD-13 order | reverse completion (6 sources) and seeded random completion (20 runs, identical results); slots by position; `positions` strictly increasing incl. a gap (NOT_RUN between finished positions); representative = min source position asserted for every group; multi query × provider (fetched once, providers/queries kept); redirects to one final URL (better-ranked representative although it finished last); L1 vs L3 groups with no transitive merge |
+| Provenance | `document.provenance.source is response.results[p].result` and `DocumentRef.search_source` identity end to end; crawl ids joined; join mismatches → `CRAWL_FAILED` / `EXTRACTION_FAILED` |
+| Errors / status | per-URL failures (404, robots, timeout) → warning `FETCH_FAILURES`, `NOT_FETCHED` documents in their slots; `NO_DOCUMENTS` → FAILED; 0 results → COMPLETED; fetch / extractor / dedup exceptions → stage errors with captured results; runtime budget → `PIPELINE_BUDGET_EXCEEDED`, nothing truncated |
+| Cancellation / race | cancel during fetch, while waiting, during extraction; B2 in CRAWLING and NORMALIZING; SEARCHING unchanged under B2; cancel landing on every new write site (CRAWLING / NORMALIZING transitions, each capture save, COMPLETED, FAILED, skip transition); finalized elsewhere before and during CRAWLING (no later fetch, nothing written after); runner shutdown → `RUNNER_INTERRUPTED` with captured results; slots and bodies back to 0 |
+| Deadlines | crawl stage timeout → NORMALIZING on captured documents, PARTIAL; job deadline in SEARCHING (row 4a) and CRAWLING (row 4b, incl. a frozen-clock case); search stage timeout with coverage continues |
+| Admission (A1–A12) | A2: 30 targets, 5 slots, 0.6 s pages, 1.0 s budget → 30 OK, 0 `FETCH_TIMEOUT` (P1 regression); A3: 6 same-host → all OK, host in-flight 1 (P5 regression); A4: two jobs → per-job ≤ 3, both complete, 0 timeouts; A5: stage deadline while waiting → `NOT_RUN`, deadline-capped timeout counted; A8: P7 residual reproduced through the pipeline and counted in `fetch_timeout_cross_host_redirect`; A9: policy-rejected URL needs no host slot, no network; A10: backpressure (`max_held` = capacity during slow extraction); A11: 1000 seeded schedules, no leaked slot; A1/A6/A7/A12 in the E2E suite |
+| Pipeline off | runner with a disabled `Pipeline` = runner without one (stored job, events, stages); API: `JobCreatedView` and `result_summary` unchanged, new keys `null`; the 845 baseline tests unchanged and passing |
+
+**Mutation (scratch copy, new tests + S02 runner/race/API suites): 31 mutants, 31 KILLED, 0 SURVIVED, 0
+EQUIVALENT.** Admission: per-host / per-job limits ignored, no round-robin, FIFO instead of lowest position,
+cancelled waiters granted, grant/cancel race not released, release not idempotent, limits not from the crawler,
+body released before extraction. Slots/joins: completion-order storage, dense position map, join checks removed,
+results captured only at the end. Cancellation/race: B2 removed (CRAWLING, NORMALIZING), captured results dropped
+on cancel, pre-start check removed, before-fetch re-read removed, stage task not registered for `cancel()`.
+Transitions: NORMALIZING after a job deadline, stage timeout not degrading, `NO_DOCUMENTS` removed, PARTIAL without
+the stage walk, search deadline through the Sprint 02 conclusion, search timeout ending the job. Budget/flag:
+runtime and static text checks removed, flag ignored, redirect `Location` ignored, selection not cut. In the first
+run M18, M19 and M21 survived; the tests that were missing (cancel/finalize *during* CRAWLING, pre-start cancel,
+clock skew) were added and the full matrix re-run.
+
+**Benchmark (§8.4 method; subprocess per scenario, VmHWM reset after setup, local server).**
+
+| Scenario | Result | Proposed threshold |
+|---|---|---|
+| (a) 30 sources × ≈ 100 KB HTML | 0.57–0.60 s (whole job), peak RSS growth 11.4–12.1 MB, 30 OK, 0 timeouts | ≤ 10 s, ≤ 128 MB — met |
+| (b) 30 sources × 5 MiB (≈ 2.3 M chars, mostly 4-byte UTF-8) | 8.65–8.67 s, 185.9–186.3 MB, 30 `PARTIAL`/`TEXT_TRUNCATED`, text exactly 30 000 000 chars, bodies held ≤ 10 | ≤ 512 MB — met |
+| (c) NORMALIZING, 30 × 1 M chars (`to_thread`) | 0.070 s, 1.4 MB | ≤ 1 s — met |
+| (d) 2 jobs × (a) concurrently | 1.18–1.19 s, 19.1–19.2 MB, 60 OK, 0 timeouts | ≤ 256 MB — met |
+
+Machine-dependent; asserted as regression bounds in `tests/integration/test_pipeline_benchmark.py`.
+
+**Real web.** Opt-in `tests/live/test_pipeline_live.py` (scripted search hits, real S04/S05/S06, TLS verification on
+with `CRAWL_CA_BUNDLE`, egress policy not bypassed): PASS — 4 hits → 3 sources (the `utm_source` variant merged by
+S01 before fetching), 3/3 fetched `OK`, 3/3 `SUCCESS`, COMPLETED, 0 `FETCH_TIMEOUT`; admission serialized the
+three same-host fetches (max admission wait 2.0 s, outside the S04 budget). Without `CRAWL_CA_BUNDLE` the same test
+FAILS at the fetch check (F-1 rule: no PASS without fetched documents).
+
+**Feature flag.** `PIPELINE_ENABLED` defaults to **false**; with it off the API creates Sprint 02 jobs exactly as
+before. Enabling it with `max_urls × EXTRACT_MAX_TEXT_CHARS > 30 000 000` fails the startup.
+
+**Residual risks / not verified.**
+- **S04-F1 residual (OD-A = A1, accepted):** a redirect hop into a host another admitted fetch is using still waits
+  inside the S04 budget (P7, A8: reproduced and counted). Its frequency on real search results is **not measured**
+  beyond the 3-source live run (0 timeouts); `CrawlStats.fetch_timeout_cross_host_redirect` and the
+  `job.stage_finished` log make it measurable. Per-host minimum interval and robots-lock waits also remain inside
+  the S04 budget (not separately distinguishable from evidence; counted as `other`/`deadline_capped`).
+- Memory with `max_concurrent_jobs` jobs all at the worst-case page size was not measured (only (b) for one job and
+  (d) with small pages); worst case ≈ 2 × (b) is an estimate.
+- Persistence: in-memory repository only; documents (text) are held in `JobResult` until the process ends;
+  PERSISTENCE-BLOCKER-01 unchanged.
+- Bot-challenge pages (OD-11) and S06 F-2 unchanged; evidence-independence requirements of §11 are for the
+  verification stage and not enforced here.
