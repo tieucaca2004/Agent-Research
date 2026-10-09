@@ -351,6 +351,63 @@ I/O-backed repository (e.g. PostgreSQL, Sprint 07+) is introduced:
 - no job may be left non-terminal, cancellation must never become `FAILED`, no state may be lost.
 The "repository does not yield" assumption must not be carried into the persistence sprint.
 
+**Status: PARTIALLY RESOLVED.** Not a statement of database readiness; the blocker stays open.
+
+What is resolved (in `JobRunner`, `src/research_agent/jobs/runner.py`):
+- **OI-1 — cancel vs. CAS save** (`7fa944b`). Every runner write (plan, SEARCHING transition, query
+  progress, terminal write) goes through `_save_update`: optimistic versioning is unchanged; on
+  `JobVersionConflictError` the job is re-read — terminal → returned as stored; cancel recorded → the job
+  finalizes `CANCELLED` (precedence cancel > deadline > stage timeout > outcome); otherwise the same
+  update is re-applied on the fresh version, at most 3 retries, then the conflict surfaces.
+- **OI1-DEF-01 — writes after a terminal state** (fixed after `7fa944b`). If another writer finalized the
+  job, the runner used to keep searching and its next progress save (same status, so the state machine
+  did not object) rewrote the terminal job's result. Now:
+  - `_save_update` never writes onto a job read as terminal. A terminal transition committed after that
+    read moves the version, so the CAS save conflicts and the re-read returns the terminal job. This
+    relies on `save` being an atomic compare-and-set on `version` (true for `InMemoryJobRepository`: check
+    and store happen under one lock; every transition increments the version).
+  - The query loop reads the job before creating each provider task and stops when it is terminal;
+    `_run_one` cancels the not-yet-awaited task when its read shows a terminal (or cancelled) job. A job
+    stopped this way logs `stopped_by=FINALIZED_ELSEWHERE` and `job.finalized_elsewhere` — never
+    `CANCELLED`, never a timeout.
+  - Guarantee: the first committed terminal state is final (status, error, result, version, timestamps
+    unchanged); no provider call starts after the runner observed the terminal state. A provider call
+    already running when another writer commits completes, but its result is never stored (at most one
+    query of wasted work). With a repository whose reads suspend, the provider task created just before
+    `_run_one`'s read can start during that read (asyncio scheduling; measured from 2 suspensions per
+    read) — it is cancelled and nothing is stored.
+
+Evidence (`tests/integration/test_job_cancel_race.py`, `tests/integration/test_job_cancel_race_hardening.py`;
+interleavings forced with repository/provider hooks, no timing-based synchronisation):
+- cancel injected before each write site (plan, SEARCHING, progress, COMPLETED, PARTIAL, FAILED by
+  providers / stage timeout / deadline) ends `CANCELLED` without error; completed queries stay in the
+  result with `INTERRUPTED` / `NOT_RUN` markers; 1000 seeded races with a yielding repository and (review
+  probe) 300 races with up to 2 ms real latency per call: 0 stuck, 0 `FAILED` (before OI-1: 90 stuck, 6
+  `FAILED/INTERNAL_ERROR`);
+- conflict retry: 1 and 3 transient conflicts at each write site are retried and applied exactly once
+  (version and events checked); a 4th conflict surfaces; a cancel between retries wins;
+- OI1-DEF-01 windows D1–D8: terminal before a progress save (CAS path), before the loop read, between the
+  two reads, during an in-flight query, during a hanging query followed by stage timeout or job deadline
+  (not reclassified), a real cancel in the same windows (still `CANCELLED` with results), and
+  `_save_update` on a terminal job (no save attempted);
+- mutation: 13/13 mutants of this logic and the unfixed runner are caught.
+
+Still open:
+- **Cancel + shutdown**: a recorded user cancel followed by cancellation of the runner task (executor
+  shutdown) ends `FAILED/RUNNER_INTERRUPTED` with `cancel_requested=True`.
+- **Writers other than cancel are not fully covered**: after 1 + 3 conflicts the runner raises and the job
+  is left non-terminal; a query in flight when another writer finalizes still costs one provider call.
+  The repository itself does not make terminal jobs immutable (a same-status save on a terminal job is
+  accepted); only the runner refrains from it.
+- **No real async I/O repository yet**: all evidence uses `InMemoryJobRepository` with injected
+  suspensions, latency or scripted writes.
+- **Required in the database sprint**: `save` must be an atomic compare-and-set on `version` (e.g.
+  `UPDATE … WHERE id = :id AND version = :expected`), every transition must increment the version, and
+  terminal-state protection at the repository level (e.g. `AND status NOT IN (terminal states)`) must be
+  decided; then the claim/save/cancel races above must be re-run against the real repository.
+- Test limits: the timeout cases use a real 0.2 s limit on a provider call that never returns; the
+  randomized suite uses seeded `sleep(0)` schedules with 0–1 ms provider delays.
+
 ### Other as-built notes
 
 - Cancel-before-claim (probe A4) is handled as expected control flow: the executor catches

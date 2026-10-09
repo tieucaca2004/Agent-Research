@@ -71,12 +71,19 @@ class _JobCancelled(Exception):
     """Internal signal: cancellation was requested for this job."""
 
 
+class _JobFinalized(Exception):
+    """Internal signal: the job reached a terminal state through another writer (OI1-DEF-01).
+
+    The stored terminal state is final: the runner stops searching and writes nothing more."""
+
+
 @dataclass
 class _SearchCapture:
     outcomes: list[QueryOutcome]
     runs: list[SearchRun]
     stop: JobErrorCode | None = None
     interrupted_index: int | None = None
+    finalized_elsewhere: bool = False
 
 
 class JobRunner:
@@ -246,9 +253,12 @@ class JobRunner:
             "job.stage_finished",
             stage=JobState.SEARCHING.value,
             duration_ms=int((time.monotonic() - started) * 1000),
-            stopped_by=capture.stop,
+            stopped_by="FINALIZED_ELSEWHERE" if capture.finalized_elsewhere else capture.stop,
         )
         job = await self._repo.get(job.id)
+        if job.is_terminal:  # only another writer can have finalized it: its state is final
+            log.warning("job.finalized_elsewhere", status=job.status.value)
+            return job
         return await self._conclude(job, plan, capture)
 
     async def _run_queries(
@@ -266,7 +276,12 @@ class JobRunner:
         try:
             async with asyncio.timeout(limit) as scope:
                 for index, query in enumerate(plan.queries):
-                    if (await self._repo.get(job.id)).cancel_requested:
+                    # Checked before the provider task exists: a job seen terminal here never
+                    # starts another provider call, whatever the repository's scheduling.
+                    latest = await self._repo.get(job.id)
+                    if latest.is_terminal:
+                        raise _JobFinalized
+                    if latest.cancel_requested:
                         raise _JobCancelled
                     capture.interrupted_index = index
                     outcome, run = await self._run_one(job, plan, index, query)
@@ -282,6 +297,8 @@ class JobRunner:
             capture.stop = limit_code
         except _JobCancelled:
             capture.stop = "CANCELLED"
+        except _JobFinalized:
+            capture.finalized_elsewhere = True
 
     async def _run_one(
         self, job: ResearchJob, plan: ResearchPlan, index: int, query: str
@@ -292,9 +309,12 @@ class JobRunner:
             self._search.search([query], plan.search_options, request_id=request_id)
         )
         self._inflight[job.id] = task
+        finalized = False
         try:
-            if (await self._repo.get(job.id)).cancel_requested:
-                task.cancel()
+            latest = await self._repo.get(job.id)
+            finalized = latest.is_terminal
+            if latest.cancel_requested or finalized:
+                task.cancel()  # not started yet unless the read above yielded to the loop
             run = await task
         except AllSearchProvidersFailedError as exc:
             outcome = QueryOutcome(
@@ -315,6 +335,8 @@ class JobRunner:
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if task.cancelled() and current is not None and current.cancelling() == 0:
+                if finalized:
+                    raise _JobFinalized from None
                 raise _JobCancelled from None  # cancelled via cancel(job_id), not our own task
             raise
         finally:
@@ -557,6 +579,11 @@ class JobRunner:
         finalizes CANCELLED instead of losing the cancel; otherwise the same update is
         re-applied on the fresh version.
         """
+        if job.is_terminal:
+            # Never write onto a job read as terminal (OI1-DEF-01). A terminal transition that
+            # commits after this read moves the version, so the CAS save below conflicts and the
+            # re-read returns the terminal job: no write ever lands after a terminal state.
+            return job
         attempts = 0
         while True:
             try:
