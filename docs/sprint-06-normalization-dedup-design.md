@@ -2,38 +2,45 @@
 
 Status: **DESIGN — not implemented.** No production code, no dependency. Decision classes:
 **[EXISTING CONTRACT]** = fixed by existing code or an approved design; **[APPROVED DECISION]** = stated
-by the founder in the Sprint 06 design review of `3a10e30` (2026-10-09); **[RECOMMENDATION]** = proposed,
-not approved; **[OPEN]** = undecided. A recommendation is never treated as an approval.
+or explicitly closed by the founder in the Sprint 06 reviews (design review of `3a10e30`; decision closure
+of `e6557da`); **[RECOMMENDATION]** = proposed, not approved; **[OPEN]** = undecided, with an owner.
+A recommendation is never treated as an approval; no item is both APPROVED and OPEN.
 §0 is the authoritative register; where older wording below differs, §0 prevails.
-Evidence ids `E1…E10` refer to probes run for this design (scratch scripts, not committed).
+Evidence ids `E1…E11` refer to probes run for this design (scratch scripts, not committed).
 
-## 0. Decision register (design review of `3a10e30`)
+## 0. Decision register (after the decision closure of `e6557da`)
 
-| # | Policy | Class | Basis / condition |
+| # | Policy | Class | Basis |
 |---|---|---|---|
 | P1 | **L1** groups documents by `source_identity = normalize_url(final_url or requested_url)` with the S01 normalizer unchanged | APPROVED DECISION (grouping) on EXISTING CONTRACT (normalizer semantics) | §6; E1, E6 |
 | P2 | **L2** groups by raw `content_sha256` exactly as produced by S04 | APPROVED DECISION | §7; E3 (may group differently-decoded texts → flagged) |
 | P3 | **L3** groups by `text_sha256`, **only `status == SUCCESS`** documents with non-empty text | APPROVED DECISION | §7; E5 (`PARTIAL` truncation twins) |
-| P4 | **L4** near-duplicate detection is **not implemented in S06** | APPROVED DECISION | §7; E6 shows real near-duplicates exist — a later sprint may design it |
+| P4 | **L4** near-duplicate detection is **not implemented in S06** | APPROVED DECISION | §7; a later design is OD-4 |
 | P5 | **Provenance**: no document is ever removed or modified; no source reference is lost; no synthetic merged document | APPROVED DECISION | §9 |
-| P6 | **Representative** = member with the lowest input position | APPROVED DECISION, **conditional** on upstream order | condition evidence E10: component order is guaranteed (S01 `to_response` ordering, tested; `Crawler.fetch_many` keeps input order, tested `test_crawler.py:837`); the *end-to-end* order of the S06 input is **not yet a contract** (no integration exists) → S06 contract: "caller passes documents in upstream (S01 result) order"; the integration sprint must guarantee and test it. Without that guarantee the representative is still deterministic for a given input sequence, but not meaningful as "first-ranked" |
+| P6 | **Representative** = member with the lowest position **in the sequence the caller passes** | APPROVED DECISION | §8. S06 makes no claim that this sequence is the S01 rank order; that end-to-end property is OD-13 (integration sprint) |
 | P7 | **No transitive merging** across L1/L2/L3; each level is its own group list | APPROVED DECISION | §7 |
-| P8 | **Hash verification uses each hash's own input semantics**: `text_sha256` = SHA-256 of `text` as UTF-8 (S05) → recomputable and verifiable; `content_sha256` = SHA-256 of decompressed body bytes (S04) → **not verifiable in S06** (bytes are not carried; re-hashing text would be the wrong input, E3) → used as given, format-checked only | APPROVED DECISION (principle) on EXISTING CONTRACT (hash definitions) | §5 |
-| P8a | `text_sha256` verification **enabled by default** | RECOMMENDATION (OD-7) | cost ≈ 2.9 ms per 1 M chars (E8) |
-| P9 | **No second text normalization** in S06 | APPROVED DECISION | §4; E4 (no-op on S05 output) |
+| P8 | **Hash verification uses each hash's own input semantics**: `text_sha256` = SHA-256 of `text` encoded UTF-8 (S05 `extractor.py`: `hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None`) → recomputable; `content_sha256` = SHA-256 of decompressed body bytes (S04) → **not verifiable in S06** (no raw bytes; re-hashing text is the wrong input, E3) → used as given, format-checked only | APPROVED DECISION (principle) on EXISTING CONTRACT (hash definitions) | §5; E11 |
+| P8a | **`text_sha256` verification is always on** (no switch): every L3 candidate's hash is recomputed from its `text` before it can be grouped; any mismatch, missing hash, hash on empty text or unencodable text excludes the document from L3 (kept, error recorded) | APPROVED DECISION (OD-7 closed) | §5.1; E8, E11 |
+| P9 | **No second text normalization** in S06 | APPROVED DECISION | §4; E4 |
 | P10 | **No tracking-parameter policy of S06's own**; only the S01 list applies; `ref` stays distinguishing | APPROVED DECISION on EXISTING CONTRACT | §6; C-6 |
 | P11 | **Bot-challenge / interstitial detection is out of S06** | APPROVED DECISION | §23; C-7 |
-| P12 | **No S06-specific document limit** (no `MAX_DOCUMENTS`); input contract checks only | RECOMMENDATION (OD-8) | §11.1 |
+| P12 | **No S06-specific document-count limit and no S06 deadline**; only input-contract checks (type, text length ≤ S05 maximum, hash format) | APPROVED DECISION (OD-8 and OD-8b closed) | §11.1 — including what the benchmark does **not** show |
 | P13 | Claimed canonical URL, `og:url`, JSON-LD ids never feed identity keys | EXISTING CONTRACT (S05: claimed metadata is unverified) | §6 |
 | P14 | `trust="UNTRUSTED"` and `kind` preserved, never elevated | EXISTING CONTRACT (S05) | §9 |
-| P15 | Pure, synchronous, offline function; output a pure function of the input sequence; keys never from `uuid4`/time | RECOMMENDATION | §10; E7 |
-| P16 | Failure semantics: kept + excluded + error code; typed errors; exceptions propagate, never an empty result | RECOMMENDATION | §11 |
+| P15 | **Deterministic for the exact input sequence passed by the caller**: same sequence → same output; keys never from `uuid4`, time, `hash()` or set order | APPROVED DECISION | §10; E7 |
+| P15b | Pure, synchronous function with no I/O (no network, files, LLM) | RECOMMENDATION (no-LLM / no-fetch are approved scope limits; "synchronous, no I/O" is the recommendation) | §10, §20 |
+| P16 | General failure semantics: kept + excluded + error code; `TypeError` for non-document input; exceptions propagate, never an empty result | RECOMMENDATION (the hash-verification part is approved under P8a) | §11 |
+| P17 | **Module location `src/research_agent/dedup/`** | APPROVED DECISION (OD-12 closed) | §22; repository precedent: stages are top-level packages (`crawler/`, `extraction/`); no `dedup` module exists. Naming note: ARCHITECTURE's planned layout lists `pipeline/dedup.py` for *entity* resolution — that future module must get a different name (§24) |
+| P18 | Names of group warnings, exclusion reasons and error codes (§7, §11); output model shape (§9) | RECOMMENDATION | §7, §9, §11 |
+
+Open items (owners): OD-1, OD-1b (founder, roadmap/architecture text), OD-4 (future L4 design), OD-6 (S01
+change request), OD-10 (database sprint), OD-11 (future S05/S07), OD-13, OD-14 (integration sprint) — §19.
 
 ## 1. Scope and baseline
 
 | Item | Value |
 |---|---|
-| Baseline | `55b858d` `fix(research): prevent writes after terminal job state`; HEAD = origin; clean tree |
+| Baseline | design written on `55b858d` `fix(research): prevent writes after terminal job state`; reviewed at `3a10e30` (design review) and `e6557da` (decision closure); docs only — no source change since `55b858d` |
 | Suite at baseline | 743 passed, 0 failed, 4 skipped (live tests: 2 REQUIRES_NETWORK, 2 REQUIRES_CONFIGURATION) |
 | Runtime | Python 3.11.15, Linux x86-64, 4 vCPU, 16 GB RAM (sandbox; shared, noisy) |
 
@@ -104,6 +111,7 @@ fetch, or persist.
 | E7 | Determinism of S04/S05 ids | `document_id`, `crawl_id` are `uuid4`; `fetched_at`/`extracted_at` are wall-clock → not usable as identity or ordering keys |
 | E8 | Prototype grouping benchmark (§13) | grouping ≤ 135 ms for 10 000 documents, peak RSS growth ≤ 4.6 MB; hash re-verification ≈ 2.9 ms per 1 M chars; input texts dominate memory |
 | E10 | Upstream ordering guarantees | S01: `SearchRun.to_response` orders by (query order, provider priority, rank, index) — `tests/unit/test_search_response.py::test_ordering_is_deterministic_regardless_of_completion_order`; S04: `fetch_many` returns results in input order — `tests/integration/test_crawler.py:837`; S05: one document per call (order = caller's). No component defines the order of the S06 input end to end (no integration yet) |
+| E11 | `text_sha256` recomputation (OD-7) | recomputing `sha256(text.encode("utf-8"))` reproduced S05's `text_sha256` for 13/13 documents (9 fixtures, app shell `EMPTY` → `None`, emoji/ZWJ, NFD source, `PARTIAL` 1 M chars); ≈ 2.1 ms per 1 M Vietnamese chars; a lone surrogate (impossible from S05 — decoding uses `replace`, invalid char refs become U+FFFD — but possible in a hand-built document) makes `encode("utf-8")` raise `UnicodeEncodeError` |
 | E9 | Dependencies | runtime deps: fastapi, httpx, pydantic, pydantic-settings, structlog, uvicorn; nothing for similarity/URL/Unicode; `hashlib`/`unicodedata`/`difflib` (stdlib) suffice for this design |
 
 ## 4. Normalization semantics
@@ -130,10 +138,21 @@ created (P9).
 | Hash / identity | Input | Canonicalization | Purpose | Deterministic | Collision risk | False-dedup risk | Stored or recomputed |
 |---|---|---|---|---|---|---|---|
 | `content_sha256` [EXISTING CONTRACT S04] | decompressed body bytes | none (raw) | L2 exact raw duplicate | yes (bytes → SHA-256) | negligible (SHA-256) | identical responses that are not content (E6 interstitial); same bytes may yield different texts (E3) | stored in provenance; **not verifiable in S06** (no bytes; re-hashing `text` would be the wrong input — E3); used as given, format-checked (64 lower-case hex) [APPROVED DECISION P8] |
-| `text_sha256` [EXISTING CONTRACT S05] | `ExtractedDocument.text` as UTF-8 | S05 extraction + normalization (E4) | L3 exact text duplicate | yes (pure function of FetchResult; E2) | negligible | **truncated `PARTIAL` documents** (E5); identical non-content pages (E6) | stored; S06 can **verify** it (same input semantics, P8); verification on by default is [RECOMMENDATION, OD-7] |
+| `text_sha256` [EXISTING CONTRACT S05] | `ExtractedDocument.text` as UTF-8 | S05 extraction + normalization (E4) | L3 exact text duplicate | yes (pure function of FetchResult; E2) | negligible | **truncated `PARTIAL` documents** (E5); identical non-content pages (E6) | stored; S06 **always verifies** it with the same input semantics before L3 grouping [APPROVED DECISION P8a] |
 | `normalized_text_sha256` | — | — | — | — | — | — | **not created** [APPROVED DECISION P9 → no extra normalization]: `text_sha256` already is the normalized-text hash defined by S05 |
 | `source_identity` [APPROVED DECISION P1] | `final_url`, else `requested_url` | `normalize_url` (S01, unchanged) | L1 same source | yes (pure string function) | n/a (string key, no hash) | `ref`-style non-tracking params keep URLs apart (false negative); a shared final URL for different requests merges (correct) | recomputed (cheap); kept in the output reference |
 | `document_identity` [RECOMMENDATION] | — | — | instance reference inside one run | — | — | — | no new hash: a document is referenced by its **input position** and `document_id` (instance id). A persistent cross-run id belongs to the database sprint (C-4, C-5) |
+
+### 5.1 `text_sha256` verification (OD-7 closed → P8a)
+
+| Aspect | Decision |
+|---|---|
+| Input | exactly S05's: `ExtractedDocument.text` encoded UTF-8 (strict), SHA-256, lower-case hex; `None` when `text == ""` |
+| When | for every L3 candidate (`status == SUCCESS`, non-empty text), before its key is used; L1/L2 do not depend on it |
+| Outcomes | equal → eligible for L3; `text_sha256` missing on non-empty text → `MISSING_TEXT_HASH`; different → `TEXT_HASH_MISMATCH`; `UnicodeEncodeError` → `TEXT_HASH_UNVERIFIABLE`; hash present on empty text → `TEXT_HASH_MISMATCH`. In every case the document is **kept**, excluded from L3 only, and the error recorded (fail closed for merging) |
+| Cost | ≈ 2.1–2.9 ms per 1 M chars (E8, E11); linear; one text encoded at a time (transient ≤ 4 bytes/char) |
+| Switch | none: an off switch would allow merging on unverified keys; the measured cost does not justify one |
+| Not covered | `content_sha256` is never "verified" (no raw bytes; P8); hashes never prove semantic equivalence |
 
 Rules [RECOMMENDATION]: keys carry their level and algorithm (`L2:sha256:<hex>`, `L3:sha256:<hex>`,
 `L1:url:<normalized>`); full 64-hex digests, never truncated; hashes are equality keys only — never
@@ -164,13 +183,13 @@ DECISION P5].
 
 | | L1 same source | L2 exact raw content | L3 exact extracted text | L4 near duplicate |
 |---|---|---|---|---|
-| Input | all documents | documents with a well-formed `content_sha256` (fetch `OK`) | `status == SUCCESS`, non-empty `text`, `text_sha256` present (and matching `text` when verification is on, OD-7) | — |
+| Input | all documents | documents with a well-formed `content_sha256` (fetch `OK`) | `status == SUCCESS`, non-empty `text`, `text_sha256` verified against `text` (P8a) | — |
 | Key | `source_identity` | `content_sha256` | `text_sha256` | — |
 | Rule | equal key, ≥ 2 members | equal key, ≥ 2 members | equal key, ≥ 2 members | **not implemented in S06** [APPROVED DECISION P4] |
-| Representative | lowest input position [APPROVED DECISION P6, conditional] | lowest input position | lowest input position | — |
+| Representative | lowest input position [APPROVED DECISION P6] | lowest input position | lowest input position | — |
 | Provenance | every member reference (§9) | every member | every member | — |
 | Group warnings [RECOMMENDATION] | `SOURCE_CONTENT_DIFFERS` (members' `content_sha256` differ, e.g. page changed between fetches), `MIXED_FETCH_STATUS` | `RAW_DUPLICATE_TEXT_DIFFERS` (members' `text_sha256` differ — E3), `CROSS_SOURCE_DUPLICATE` | `CROSS_SOURCE_DUPLICATE` (members from > 1 source identity / host — E6) | — |
-| Exclusions [RECOMMENDATION] | `INVALID_SOURCE_URL` | `NO_CONTENT_HASH`, `INVALID_CONTENT_HASH` | `NOT_SUCCESS` (incl. `PARTIAL` — E5), `EMPTY_TEXT`, `TEXT_HASH_MISMATCH`, `MISSING_TEXT_HASH` | — |
+| Exclusions [RECOMMENDATION] | `INVALID_SOURCE_URL` | `NO_CONTENT_HASH`, `INVALID_CONTENT_HASH` | `NOT_SUCCESS` (incl. `PARTIAL` — E5), `EMPTY_TEXT`, `TEXT_HASH_MISMATCH`, `MISSING_TEXT_HASH`, `TEXT_HASH_UNVERIFIABLE` | — |
 | False positive risk | none beyond the normalizer's contract (same normalized URL = same resource) | identical non-content responses (interstitials, error pages) | identical non-content pages; truncation (excluded) | — |
 | False negative risk | non-listed tracking params, `www.`/slash variants (E1, E6) | any byte difference (timestamps, nonces) | any text difference (E2: one word, case, markup) | — |
 
@@ -187,11 +206,14 @@ DECISION P5].
 
 ## 8. Winner selection
 
-[APPROVED DECISION P6, conditional] **No quality-based winner.** Each group has a *representative* = the
-member with the lowest input position, mirroring the S01 precedent (first occurrence in a deterministic
-upstream order). Condition: the S06 input must arrive in upstream (S01 result) order — guaranteed per
-component today (E10), to be guaranteed end to end by the integration sprint. All members stay in the group
-with full provenance; consumers may use any member.
+[APPROVED DECISION P6] **No quality-based winner.** Each group has a *representative* = the member with the
+lowest position in the sequence the caller passes, mirroring the S01 precedent (first occurrence in a
+deterministic order). All members stay in the group with full provenance; consumers may use any member.
+
+- **Function contract vs. end-to-end order.** S06 only promises P6/P15 *for the sequence it receives*. It
+  does not check, and the design does not claim, that this sequence is the S01 rank order. Today each
+  component preserves order (E10), but no integration composes them; whether the representative is the
+  "best-ranked" search hit is therefore unproven until the integration sprint guarantees and tests it (OD-13).
 
 - For L3 the choice cannot change cited text (all members' texts are identical); it only decides which
   URL is listed first.
@@ -240,7 +262,7 @@ Nothing is ever merged into a synthetic document.
 
 ## 10. Deterministic ordering
 
-- Output is a **pure function of the input sequence** [RECOMMENDATION P15]: `refs` and `documents` keep input order;
+- Output is **deterministic for the exact input sequence** [APPROVED DECISION P15]: `refs` and `documents` keep input order;
   groups are ordered by representative position; members ascending; group keys derived from content/URL,
   never from `uuid4` or time (E7).
 - Python `dict` insertion order (defined behaviour) may be used; set iteration order and `hash()` must
@@ -249,28 +271,30 @@ Nothing is ever merged into a synthetic document.
   order follow the new order — intended, since the representative is defined by upstream order (P6).
   Order-invariant representatives are not part of S06.
 - No parallelism: grouping is O(n) and sub-second at 10 000 documents (E8).
+- End-to-end order (search rank → fetch → extraction → S06) is **not** an S06 property and is not claimed
+  (OD-13); S06 tests only cover order relative to the input sequence.
 
 ## 11. Failure semantics
 
 | Situation | Behaviour [RECOMMENDATION P16] |
 |---|---|
-| A document's key cannot be derived (invalid URL, missing / mismatching `text_sha256`, malformed `content_sha256`, text longer than S05's configurable maximum of 10 M chars) | document **kept** in `documents`/`refs`; excluded from that level with a reason; error code recorded; never merged on a doubtful key (fail closed for merging) |
+| A document's key cannot be derived (invalid URL, missing / mismatching / unverifiable `text_sha256` (§5.1), malformed `content_sha256`, text longer than S05's configurable maximum of 10 M chars) | document **kept** in `documents`/`refs`; excluded from that level with a reason; error code recorded; never merged on a doubtful key (fail closed for merging) |
 | `NOT_FETCHED` / `UNSUPPORTED` / `FAILED` / `EMPTY` / `PARTIAL` documents | kept; take part in L1 (and L2 when bytes were fetched); excluded from L3 with a reason (P3) |
 | Input is not a sequence of `ExtractedDocument` | `TypeError` before processing (programming error, not data) |
 | Unexpected exception | propagates; never an empty or "no duplicates" result. When integrated, the caller records a stage error (e.g. `DEDUP_FAILED`) — JobRunner contract unchanged in S06 |
-| Deadline / cancellation | pure synchronous function; measured worst case at the job maximum ≈ 2.3 s (verification of 800 × 1 M chars, extrapolated from E8). Optional cooperative deadline raising a typed timeout, never partial grouping [OPEN, OD-8b] |
+| Deadline / cancellation | **no S06 deadline** [APPROVED DECISION P12]; synchronous function (P15b). Measured: verification of 1 G chars ≈ 2.9 s (E8); 800 documents at the S05 *default* cap (800 M chars) extrapolates to ≈ 2.3 s. Time bounds for the whole pipeline stage belong to the integration (OD-14), not to S06 |
 | Memory | references only; peak growth ≤ 4.6 MB at 10 000 documents (E8); verification encodes one text at a time (≤ 4 bytes/char) |
 
-### 11.1 Document limit (`MAX_DOCUMENTS`) — evaluation
+### 11.1 Document limit and deadline (OD-8 / OD-8b closed → P12)
 
 | Question | Answer (evidence) |
 |---|---|
 | Upstream bound today | ≤ 800 search hits per job (8 queries × 50 results × 2 providers, §2.2), already deduplicated by URL in S01; one ExtractedDocument per fetched URL |
-| S06's own cost | O(n): 10 000 documents grouped in ≤ 135 ms with ≤ 4.6 MB peak growth (E8). The only text-proportional cost is `text_sha256` verification (≈ 2.9 ms per 1 M chars) |
-| Memory | held by the caller before S06 runs (texts already extracted); a count limit in S06 would not reduce it |
-| Does a count limit bound the real cost? | No — verification cost follows total characters, which S05 already caps per document (1 M default, 10 M max) |
-| Conclusion | **No S06-specific document limit** [RECOMMENDATION P12, OD-8]: no evidence-based reason; it would add a failure mode without protecting anything. Input-contract checks stay (type, text length ≤ S05 maximum, hash format) |
-| If the founder wants a limit anyway | apply it **before** any grouping (validate input size first); raise a typed `DedupInputTooLarge(count, limit)`; process nothing — no truncation, no partial groups, input untouched; value from evidence (e.g. 2 000 = 2.5 × the job maximum) |
+| S06's own cost | grouping is O(n): 10 000 documents in ≤ 135 ms with ≤ 4.6 MB peak growth (E8). The only text-proportional cost is `text_sha256` verification (≈ 2.1–2.9 ms per 1 M chars, E8/E11) |
+| Does a count limit bound the real cost? | no — verification cost follows total characters, not document count; memory for texts is held by the caller before S06 runs |
+| Decision | **no S06 document-count limit, no S06 deadline** [APPROVED DECISION P12]; input-contract checks only (type, text length ≤ S05's 10 M-char maximum, hash format). No truncation, no partial results |
+| What the benchmark does **not** show | the 10 000-document result measures **grouping overhead** only. It does **not** show that every text volume is safe: verification is linear in total characters and was measured up to **1 G chars** (≈ 2.9 s, ≈ 2 GB of input held by the caller). Larger totals — e.g. 800 documents at the 10 M-char S05 *configurable maximum* = 8 G chars — were **not** measured and are **not** claimed safe |
+| Where total volume is bounded | upstream: S05 per-document cap (1 M default) and job sizing. Whether the integration needs a total-text bound or a stage time limit is OD-14 (integration sprint) — not a new S06 limit |
 
 ## 12. Security limits
 
@@ -285,7 +309,7 @@ Nothing is ever merged into a synthetic document.
 - **Pathological Unicode**: no normalization in S06, so no NFC/NFKC amplification; hashing is linear
   (E8: 1 M combining-mark chars ≈ 2.9 ms).
 - **Oversized input**: bounded upstream (≤ 800 hits per job, S05 per-document text cap); no S06 count
-  limit (P12, §11.1); S06 adds no copies of texts.
+  limit or deadline (P12, §11.1); S06 adds no copies of texts. Total-volume bounds: OD-14.
 - Logs: counts, levels and hashes only — no text, titles or full URLs with queries.
 
 ## 13. Performance measurements
@@ -313,8 +337,10 @@ Peak RSS growth of the grouping step: ≤ 4.6 MB in every scenario. 10 000 × 1 
 documents (≈ 20 GB of input) was not run: the *inputs* exceed this machine, S06 is not the bottleneck.
 
 Performance budgets for the implementation's benchmark test, derived from E8 [RECOMMENDATION]: at 2 000
-documents (2.5 × the 800-hit job maximum — a test size, not a runtime limit, see §11.1) grouping ≤ 0.5 s,
-grouping + verification of S05-capped texts ≤ 5 s, peak RSS growth ≤ 32 MB. Input memory is the caller's.
+documents (2.5 × the 800-hit job maximum — a **test size, not a runtime limit**, P12) grouping ≤ 0.5 s,
+grouping + verification ≤ 5 s for texts up to 100 k chars each, peak RSS growth ≤ 32 MB. These budgets
+regress the measured behaviour; they do not certify larger text volumes (§11.1). Input memory is the
+caller's.
 
 ## 14. Dependency decision
 
@@ -325,6 +351,9 @@ normalizer is the contract), Unicode libraries (no normalization in S06).
 
 ## 15. Test matrix (for implementation)
 
+Only S06's own contract (the function over a given input sequence). Integration-level properties are listed
+separately in §15.1 and are **not** S06 tests.
+
 | Group | Cases |
 |---|---|
 | Normalization (P9) | S06 never changes `text`/title/metadata (object identity and equality); NFC/NFD sources (via S05) hash equal; NFKC-sensitive text (`mc²`, `①`, full-width) untouched; code fences/tables/lists untouched; empty text never keyed; Zalgo/ZWJ text hashed linearly |
@@ -332,15 +361,22 @@ normalizer is the contract), Unicode libraries (no normalization in S06).
 | L1/L2/L3 (P1–P3) | 2-way and N-way groups per level; L1 with different content (`SOURCE_CONTENT_DIFFERS`), mixed fetch statuses (`MIXED_FETCH_STATUS`); L2 with different texts (`RAW_DUPLICATE_TEXT_DIFFERS`, E3); L3 across hosts (`CROSS_SOURCE_DUPLICATE`); mixed unique/duplicates; duplicates with different metadata, warnings, statuses, search provenance — all retained |
 | No transitive merging (P7) | A~B only at L2, B~C only at L3 → no group contains A and C; each level's groups computed from its own key only |
 | Eligibility (P3) | `PARTIAL` truncation twins (E5) not grouped at L3 but still L1/L2; `EMPTY`/`NOT_FETCHED`/`FAILED`/`UNSUPPORTED` never L3; `NOT_FETCHED` still L1 |
-| Hash semantics (P8) | `text_sha256` recomputed from `text` UTF-8 equals S05's; tampered `text_sha256` → `TEXT_HASH_MISMATCH`, excluded from L3, kept; `content_sha256` never recomputed from text (same bytes / different charsets stay one L2 group, E3); malformed `content_sha256` (not 64 lower-case hex) → `INVALID_CONTENT_HASH`, excluded from L2 |
-| Provenance (P5, P14) | every input document appears exactly once in `refs`, fields equal to its source; `documents` are the same objects in the same order; groups list all members, `source_identities` and `hosts`; `trust`/`kind` preserved; `search_source` is the same object; a sentence of an L3 representative resolves to all member URLs |
+| Hash verification (P8, P8a) | recomputed `sha256(text UTF-8)` equals S05's for real S05 output; tampered hash → `TEXT_HASH_MISMATCH`; missing hash on non-empty text → `MISSING_TEXT_HASH`; hash on empty text → `TEXT_HASH_MISMATCH`; hand-built document with a lone surrogate → `TEXT_HASH_UNVERIFIABLE` (no crash); in all cases document kept and excluded from L3 only; there is no way to disable verification; `content_sha256` never recomputed from text (same bytes / different charsets stay one L2 group, E3); malformed `content_sha256` → `INVALID_CONTENT_HASH`, excluded from L2 |
+| Provenance (P5, P14) | every input document appears exactly once in `refs`, fields equal to its source; `documents` are the same objects in the same order; groups list all members, `source_identities` and `hosts`; `trust`/`kind` preserved; `search_source` is the same object; for any L3 member the group exposes all member URLs and their search provenance |
 | Representative / ordering (P6) | representative = lowest position in every group; groups ordered by representative; members ascending; reversed/shuffled input → identical member sets, representatives follow the new order |
-| Determinism (P15) | same input × 50 runs → identical output; subprocess runs with different `PYTHONHASHSEED` → identical output; no `uuid4`/time in keys |
+| Determinism (P15) | same input sequence × 50 runs → identical output; subprocess runs with different `PYTHONHASHSEED` → identical output; no `uuid4`/time in keys |
 | Security | provenance-spoof page (claimed canonical = another URL); shared interstitial across hosts → one L2/L3 group with `CROSS_SOURCE_DUPLICATE`, all members kept; text longer than 10 M chars → excluded with error |
 | Failure (P16) | one bad document among good ones (kept, excluded, error); all documents bad (no groups, every document kept with errors — not an exception); non-`ExtractedDocument` input → `TypeError`; injected exception inside grouping propagates (no empty result) |
-| Limit (only if OD-8 adopts one) | limit + 1 documents → `DedupInputTooLarge` before processing, input untouched |
+| No limit / no deadline (P12) | 10 000 documents processed completely (no truncation, no error); no deadline parameter exists |
 | Performance | §13 scenarios as a `benchmark`-marked test with the §13 budgets |
-| Real world | §17 |
+| Real world | §17 (opt-in, standalone S04 → S05 → S06; not a JobRunner integration) |
+
+### 15.1 Deferred to the integration sprint (not S06 tests; do not exist yet)
+
+- End-to-end order: documents reach S06 in S01 result order through fetch and extraction, so the
+  representative is the best-ranked hit (OD-13).
+- Total text volume / stage time behaviour of the integrated pipeline (OD-14).
+- Mapping of S06 exceptions to a job stage error (e.g. `DEDUP_FAILED`) without changing JobRunner semantics.
 
 ## 16. Mutation matrix (for implementation)
 
@@ -356,7 +392,7 @@ normalizer is the contract), Unicode libraries (no normalization in S06).
 | N8 | ordering reversed (groups or members) | ordering tests |
 | N9 | duplicate group removed / members collapsed into one document | group-retention tests |
 | N10 | key error swallowed (document dropped or silently grouped) | failure tests |
-| N11 | input limit ignored (only if OD-8 adopts a limit) | limit test |
+| N11 | `text_sha256` verification skipped (L3 groups on the stored hash without recomputing) | tampered-hash test |
 | N12 | `PARTIAL` admitted to L3 | truncation twin test |
 | N13 | empty text keyed (`text_sha256 None` grouped) | empty test |
 | N14 | trust elevated / `kind` changed | provenance test |
@@ -364,6 +400,8 @@ normalizer is the contract), Unicode libraries (no normalization in S06).
 | N16 | transitive merging across levels (union of L1/L2/L3) | no-transitive-merging test |
 | N17 | tracking parameters stripped beyond the S01 list (e.g. `ref`) | `ref` identity test |
 | N18 | representative = highest position / last member | representative test |
+| N19 | `UnicodeEncodeError` during verification propagates (crash) instead of `TEXT_HASH_UNVERIFIABLE` | lone-surrogate test |
+| N20 | a hidden limit or truncation (e.g. only the first N documents grouped) | 10 000-document completeness test |
 
 ## 17. Real-world validation plan
 
@@ -378,7 +416,7 @@ not "fixed"). Records: levels, keys (hash prefixes), members, warnings, exclusio
 | Id | Description | Evidence | Impact | Disposition |
 |---|---|---|---|---|
 | C-1 | ARCHITECTURE §8/§9/§21 define Sprint 06 as normalization of **extracted entity fields** and **entity resolution** (`phonenumbers`, `rapidfuzz`, merge thresholds); the founder's brief defines S06 as **document-level** normalization/dedup | ARCHITECTURE §8, §9, §21 row 06; no entity records exist (AI structured extraction unscheduled since Sprint 05 OD-1) | entity work cannot be built without entities; document-level S06 needs no new dependency | **Resolved in scope**: S06 = document level (founder brief). Entity normalization/resolution is **not dropped**: it moves after AI structured extraction. ARCHITECTURE text change proposed in §24, **not applied** (needs approval) |
-| C-2 | Roadmap: brief maps S07 = Verification, S08 = Synthesis/Report; ARCHITECTURE §21 has 07 Verification, 08 Database (must resolve PERSISTENCE-BLOCKER-01), 09 UI, 10 Export, 11 Hardening; no Synthesis sprint exists there | ARCHITECTURE §21; docs/sprint-03-research-api.md §22 | S07 maps consistently; S08 does not; the persistence blocker is tied to "the database sprint" | **OPEN (OD-1b)**: founder chooses (a) insert Synthesis/Report as 08 and shift Database → 09, or (b) keep Database 08 and schedule Synthesis later. S06 does not depend on it. Proposed wording for both options in §24, not applied |
+| C-2 | Roadmap: brief maps S07 = Verification, S08 = Synthesis/Report; ARCHITECTURE §21 has 07 Verification, 08 Database (must resolve PERSISTENCE-BLOCKER-01), 09 UI, 10 Export, 11 Hardening; no Synthesis sprint exists there | ARCHITECTURE §21; docs/sprint-03-research-api.md §22 | S07 maps consistently; S08 does not; the persistence blocker is tied to "the database sprint" | **OPEN (OD-1b), roadmap only**: not a technical dependency of the S06 module — S06 consumes S05 output and produces groups for whatever stage follows. Founder chooses (a) insert Synthesis/Report as 08 and shift Database → 09, or (b) keep Database 08 and schedule Synthesis later. ARCHITECTURE numbering is not changed by this design (§24, not applied) |
 | C-3 | ARCHITECTURE §10 verification counts independent domains and requires a document row per cited URL | ARCHITECTURE §10 | collapsing duplicates would lose URLs; counting URLs of an exact-copy group would inflate independence (E6) | **Resolved in S06 design** (P5): every member kept; groups expose `source_identities` and `hosts`. **Requirement handed to S07** (not decided here): S07 must distinguish *source URLs* from *independent evidence groups* |
 | C-4 | ARCHITECTURE §5/§12: one `documents` row per `(url, content_hash)`; `content_hash` undefined (raw `content_sha256` vs text `text_sha256`), `url` undefined (requested / final / normalized) | ARCHITECTURE §5, §12 | ambiguity only matters for persistence | **Deferred to the database sprint (OD-10)**. Recommendation for that sprint: store both hashes under their explicit names and the normalized final URL; never an unqualified `content_hash` |
 | C-5 | Provenance tables expect stable `document_id`s; S04/S05 ids are random per run | E7; ARCHITECTURE §11/§12 | no cross-run identity today | **Accepted limitation**: S06 references documents by input position + instance ids, keys from content/URL only; stable ids with persistence. No change to S04/S05 |
@@ -387,23 +425,21 @@ not "fixed"). Records: levels, keys (hash prefixes), members, warnings, exclusio
 
 ## 19. Open decisions
 
-Closed by the design review (now APPROVED DECISIONS in §0): former OD-2 (L3 = `SUCCESS` only → P3), OD-3
-(representative = first input position → P6, conditional), OD-5 (no extra normalized-text key → P9), OD-9
-(no cross-level merging → P7); OD-4 and OD-11 narrowed (not in S06 → P4, P11).
+Closed (now in §0): OD-2 → P3, OD-3 → P6, OD-5 → P9, OD-9 → P7 (design review of `3a10e30`);
+**OD-7 → P8a, OD-8 and OD-8b → P12, OD-12 → P17** (decision closure of `e6557da`).
 
-| Id | Question | Recommendation |
-|---|---|---|
-| OD-1 | Update ARCHITECTURE §8/§9/§21 for document-level S06 (C-1) | approve the §24 wording |
-| OD-1b | Roadmap order after S07: Synthesis/Report vs Database as Sprint 08 (C-2) | founder choice; S06 unaffected |
-| OD-4 | Design of near-duplicate detection (L4) in a later sprint | separate design with a labelled sample |
-| OD-6 | Extend the S01 tracking-parameter list (`ref`, …) | separate S01 change request, not in S06 |
-| OD-7 | `text_sha256` verification on by default | yes (≈ 2.9 ms per 1 M chars) |
-| OD-8 | S06 document limit | none (§11.1); if wanted: checked before grouping, typed `DedupInputTooLarge`, no truncation |
-| OD-8b | Cooperative deadline in S06 | not needed at measured costs; if wanted: typed timeout, no partial result |
-| OD-10 | Persistent document identity `(url, content_hash)` | database sprint; store both hashes by name |
-| OD-11 | Interstitial / bot-challenge detection | future S05/S07 decision |
-| OD-12 | Module location / name | `src/research_agent/dedup/` (`models`, `identity`, `grouping`) |
-| OD-13 | End-to-end input order contract for S06 (condition of P6) | integration sprint guarantees S01 result order and tests it |
+Still open — none blocks implementing the S06 module:
+
+| Id | Question | Owner | Recommendation |
+|---|---|---|---|
+| OD-1 | Update ARCHITECTURE §8/§9/§21 for document-level S06 (C-1) | founder | approve the §24 wording |
+| OD-1b | Roadmap order after S07: Synthesis/Report vs Database as Sprint 08 (C-2) — roadmap only, no technical dependency | founder | founder choice |
+| OD-4 | Design of near-duplicate detection (L4) | later sprint | separate design with a labelled sample |
+| OD-6 | Extend the S01 tracking-parameter list (`ref`, …) | S01 change request | not in S06 |
+| OD-10 | Persistent document identity `(url, content_hash)` | database sprint | store both hashes by name and the normalized final URL |
+| OD-11 | Interstitial / bot-challenge detection | future S05/S07 | — |
+| OD-13 | End-to-end input order (S01 rank order preserved through fetch/extraction into S06) | integration sprint | guarantee it and test it (§15.1) |
+| OD-14 | Total text volume / stage time bounds for the integrated pipeline | integration sprint | decide from measurements at integration; not an S06 limit (P12) |
 
 ## 20. Explicit non-goals
 
@@ -414,18 +450,21 @@ orchestration, changes to S01–S05 (including `normalize_url` and the tracking 
 
 ## 21. Acceptance criteria (implementation sprint)
 
-1. `group_documents(documents) -> DocumentSet` is pure, synchronous, offline and deterministic (§10).
+1. `group_documents(documents) -> DocumentSet` is deterministic for the exact input sequence (P15); synchronous with no I/O if P15b is approved.
 2. No input document is ever dropped or modified; `trust`/`kind` preserved; `text` untouched (P5, P9, P14).
-3. L1/L2/L3 exactly as P1–P3 and §7, separate lists (P7), representative per P6, warnings and exclusions as listed; L4 absent (P4).
-4. Hash handling per P8: `text_sha256` verified with its own input semantics (if OD-7 approved); `content_sha256` used as given and format-checked, never recomputed from text.
-5. Failure semantics of §11 (kept + excluded + error; typed errors; no empty result on exceptions); limit only if OD-8 adopts one.
-6. Test matrix §15 implemented; mutation matrix §16 all killed or documented as equivalent with reason.
+3. L1/L2/L3 exactly as P1–P3 and §7, separate lists (P7), representative per P6, warnings and exclusions as listed (P18); L4 absent (P4).
+4. Hash handling per P8/P8a: `text_sha256` always verified with S05's input semantics (§5.1); `content_sha256` used as given and format-checked, never recomputed from text.
+5. Failure semantics of §11 (kept + excluded + error; no empty result on exceptions); no document-count limit and no deadline (P12).
+6. Test matrix §15 implemented (§15.1 excluded); mutation matrix §16 all killed or documented as equivalent with reason.
 7. Real-world validation §17 recorded (opt-in); S01–S05 suites unchanged and green; ruff, mypy strict,
    bandit, pip-audit, secret scan, `git diff --check` clean; no new dependency.
 
 ## 22. Implementation plan (next sprint, after approval)
 
-1. `src/research_agent/dedup/config.py` — only if needed (verification switch per OD-7; limit only if OD-8 adopts one).
+Module: `src/research_agent/dedup/` (P17). No configuration module: verification has no switch (P8a) and
+there is no limit or deadline (P12).
+
+1. `__init__.py` — public API (`group_documents`, models).
 2. `models.py` — `DocumentRef`, `DuplicateGroup`, `DocumentSet`, warning/exclusion/error enums.
 3. `identity.py` — `source_identity()` over `normalize_url`; key builders with level prefixes.
 4. `grouping.py` — single pass in input order, per-level dict grouping, eligibility, warnings, errors.
@@ -461,6 +500,8 @@ Requires founder approval (OD-1, OD-1b); this review changes only this document.
 4. C-2, depending on OD-1b: option (a) insert "08 Synthesis/Report" and renumber Database → 09 (and update
    the PERSISTENCE-BLOCKER-01 wording to "the database sprint"); option (b) keep 08 Database and add
    Synthesis/Report after it.
+5. §2 Module layout — note that the planned `pipeline/dedup.py` ("entity resolution") must get a distinct
+   name when built (e.g. `entities/`), since document-level dedup lives in `src/research_agent/dedup/` (P17).
 
 Impact: documentation only; no code, test or dependency change; `phonenumbers`/`rapidfuzz` remain future
 mentions; PERSISTENCE-BLOCKER-01 unchanged (still PARTIALLY RESOLVED).
