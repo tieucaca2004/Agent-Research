@@ -1,6 +1,7 @@
 # Sprint 06 — Normalization / Dedup (design)
 
-Status: **DESIGN — not implemented.** No production code, no dependency. Decision classes:
+Status: **DESIGN approved at `15afa1e`; IMPLEMENTED** — as-built record and evidence in §25 (design text
+below unchanged). No new dependency. Decision classes:
 **[EXISTING CONTRACT]** = fixed by existing code or an approved design; **[APPROVED DECISION]** = stated
 or explicitly closed by the founder in the Sprint 06 reviews (design review of `3a10e30`; decision closure
 of `e6557da`); **[RECOMMENDATION]** = proposed, not approved; **[OPEN]** = undecided, with an owner.
@@ -505,3 +506,77 @@ Requires founder approval (OD-1, OD-1b); this review changes only this document.
 
 Impact: documentation only; no code, test or dependency change; `phonenumbers`/`rapidfuzz` remain future
 mentions; PERSISTENCE-BLOCKER-01 unchanged (still PARTIALLY RESOLVED).
+
+## 25. Implementation status and evidence (as built)
+
+Implemented per §22 against the approved design (`15afa1e`); no decision in §0 was changed.
+
+**Files.** `src/research_agent/dedup/{__init__,models,identity,grouping}.py` (no config module);
+tests `tests/unit/test_dedup_identity.py`, `tests/unit/test_dedup_grouping.py`,
+`tests/integration/test_dedup.py`, `tests/integration/test_dedup_benchmark.py` (marker `benchmark`),
+`tests/live/test_dedup_live.py` (marker `live_network`), helper `tests/dedup_support.py`. No change to
+S01–S05 source/tests, SearchService, crawler, extraction, JobRunner, API, repository, schema,
+dependencies or ARCHITECTURE.md.
+
+**API.** `group_documents(documents: Sequence[ExtractedDocument]) -> DocumentSet` — the only parameter;
+no switch, limit or deadline. `DocumentSet`: `s06_version="s06.1"`, `documents` (the input objects, same
+order), `refs` (one `DocumentRef` per position), `groups` (`L1`/`L2`/`L3` → `DuplicateGroup` lists),
+`exclusions`, `errors`, `stats`. Keys: `L1:url:<identity>`, `L2:sha256:<content_sha256>`,
+`L3:sha256:<recomputed text digest>`.
+
+**As-built details (within the design).**
+- Verification-by-construction (P8): the L3 key *is* the digest recomputed from `text.encode("utf-8")`;
+  the stored `text_sha256` is only compared, never used as a key, so no code path groups at L3 without
+  verification. Check order: not `SUCCESS` → `NOT_SUCCESS`; empty text → `EMPTY_TEXT` (or
+  `TEXT_HASH_MISMATCH` if a hash is present); length > 10 000 000 (S05 `max_text_chars` upper bound,
+  asserted equal in a test) → `TEXT_TOO_LONG`; no hash → `MISSING_TEXT_HASH`; `UnicodeEncodeError` →
+  `TEXT_HASH_UNVERIFIABLE`; digest differs → `TEXT_HASH_MISMATCH`.
+- `errors` = exclusions whose reason is a contract violation (`INVALID_SOURCE_URL`,
+  `INVALID_CONTENT_HASH`, `TEXT_TOO_LONG`, `MISSING_TEXT_HASH`, `TEXT_HASH_MISMATCH`,
+  `TEXT_HASH_UNVERIFIABLE`); ineligibility (`NOT_SUCCESS`, `EMPTY_TEXT`, `NO_CONTENT_HASH`) is not an error.
+- Identity: S01 `normalize_url` raises plain `ValueError` (from `urlsplit`) for malformed hosts such as
+  `http://[::1`, besides `InvalidURLError`; S06 treats both as "no identity" (`INVALID_SOURCE_URL`,
+  document kept). S01 is **not modified** (known S01 behaviour, recorded here only).
+- Input validation: `str`/`bytes`, non-sequences (incl. generators) and non-`ExtractedDocument` items →
+  `TypeError` before any processing. Unexpected exceptions propagate (no empty/partial result).
+- Log `dedup.grouped` carries counts only (no URLs, no text).
+
+**Tests (this sprint).** 86 passed + 1 live (opt-in): identity 19, grouping 48, integration with real S05
+extraction 16, benchmark 3. Covers every §15 group, including: tampered / forged-copy / missing / empty /
+lone-surrogate / over-long hashes; tampered hash at text sizes 1 … 10 000 000 (no size fast path); a
+recording test proving each L3 member was hashed from its own text exactly once; E3 same-bytes /
+different-charset L2 group; PARTIAL twins; no transitive merging; provenance identity and unchanged
+`model_dump`; representative / ordering / reversed input; 50 identical runs and 4 `PYTHONHASHSEED`
+subprocesses; 10 000 documents complete.
+
+**Mutation (§16).** 42 mutants over N1–N20 (variants per row), run on a scratch copy against the dedup
+tests: **42 KILLED, 0 SURVIVED, 0 EQUIVALENT**. Variants: N1 (output rewritten, NFC before verify), N2
+(NFKC), N3 (strip / UTF-16 / title in hash input), N4 (L2, L3 disabled), N5 (L3 on content hash, L1 on
+requested URL, L1 on claimed canonical), N6 (member, `search_source`, `hosts`, `crawl_id`, `warnings`
+lost), N7 (representative by `document_id`, groups by key, groups in set order), N8 (members / groups
+reversed), N9 (2-member groups dropped, documents collapsed), N10 (identity exception swallowed, invalid
+URL grouped, bad content hash grouped, L3 errors hidden), N11 (stored hash used, size fast path, cache on
+stored hash, skip when raw hash seen), N12, N13, N14 (trust, kind), N15, N16, N17, N18, N19, N20 (document
+limit, member cap).
+
+**Benchmark (§13, subprocess per scenario, best of 3, VmHWM reset).**
+
+| Scenario | Docs | Input chars | Time | Peak RSS growth | Budget |
+|---|---|---|---|---|---|
+| short_2000 | 2 000 | 77 450 | 0.044 s | 9.8 MB | ≤ 0.5 s, ≤ 32 MB — met |
+| large_2000 (~100 k chars each, verification incl.) | 2 000 | 197 406 890 | 0.403 s | 7.7 MB | ≤ 5 s, ≤ 32 MB — met |
+| groups_10000 | 10 000 | 154 450 | 0.239 s | 45.5 MB | completeness only (no budget) — complete |
+
+Machine-dependent; budgets are assertions in `test_dedup_benchmark.py`.
+
+**Real web (§17).** `RUN_LIVE_NETWORK=1`, TLS verification on (proxy CA via `CRAWL_CA_BUNDLE`), egress
+policy not bypassed; PASS. PyPI `…/httpx/`, `?utm_source=probe`, `#history` → one group of 3 at L1, L2
+and L3; `…/0.28.1/` → in no group with them; `…/project/httpx` and `…/project/HTTPX/` → L2 and L3 group
+of two with `CROSS_SOURCE_DUPLICATE` (challenge pages with `LOW_CONFIDENCE_MAIN_CONTENT`; recorded, not
+"fixed", §23); no exclusions, no errors.
+
+**Not done / unverified (unchanged, §15.1).** End-to-end order S01 → crawler → extraction → S06 and the
+claim "representative = best-ranked hit" (OD-13); total-volume / stage-time bounds of the integrated
+pipeline (OD-14); mapping of S06 exceptions to a job stage error. These belong to the integration sprint;
+no S06 test claims them. The `benchmark` marker description in `pyproject.toml` still says "extraction"
+(not edited: outside the allowed file scope).
