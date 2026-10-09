@@ -110,7 +110,7 @@ fetch, or persist.
 | E5 | Empty / failed / truncated documents | `EMPTY`: `text_sha256=None`; `NOT_FETCHED`: both hashes `None`; **two `PARTIAL` documents truncated at 1 M chars with different full content have the same `text_sha256`** |
 | E6 | Real web (S04 → S05, egress-allowed host) | `pypi.org/project/httpx/`, `…/?utm_source=probe`, `…/#history` → same source identity, same `content_sha256` and `text_sha256`; `…/0.28.1/` → different hashes, line similarity 0.998 (near-duplicate); `…/project/httpx` (no slash) and `…/project/HTTPX/` → HTTP **200 "Client Challenge"** interstitial (209 chars, S05 `SUCCESS` + `LOW_CONFIDENCE_MAIN_CONTENT`), **identical hashes across two URLs** |
 | E7 | Determinism of S04/S05 ids | `document_id`, `crawl_id` are `uuid4`; `fetched_at`/`extracted_at` are wall-clock → not usable as identity or ordering keys |
-| E8 | Prototype grouping benchmark (§13) | grouping ≤ 135 ms for 10 000 documents, peak RSS growth ≤ 4.6 MB; hash re-verification ≈ 2.9 ms per 1 M chars; input texts dominate memory |
+| E8 | Prototype grouping benchmark (§13) — superseded for the implementation by the as-built measurements in §25 | grouping ≤ 135 ms for 10 000 documents, peak RSS growth ≤ 4.6 MB (prototype); hash re-verification ≈ 2.9 ms per 1 M chars; input texts dominate memory |
 | E10 | Upstream ordering guarantees | S01: `SearchRun.to_response` orders by (query order, provider priority, rank, index) — `tests/unit/test_search_response.py::test_ordering_is_deterministic_regardless_of_completion_order`; S04: `fetch_many` returns results in input order — `tests/integration/test_crawler.py:837`; S05: one document per call (order = caller's). No component defines the order of the S06 input end to end (no integration yet) |
 | E11 | `text_sha256` recomputation (OD-7) | recomputing `sha256(text.encode("utf-8"))` reproduced S05's `text_sha256` for 13/13 documents (9 fixtures, app shell `EMPTY` → `None`, emoji/ZWJ, NFD source, `PARTIAL` 1 M chars); ≈ 2.1 ms per 1 M Vietnamese chars; a lone surrogate (impossible from S05 — decoding uses `replace`, invalid char refs become U+FFFD — but possible in a hand-built document) makes `encode("utf-8")` raise `UnicodeEncodeError` |
 | E9 | Dependencies | runtime deps: fastapi, httpx, pydantic, pydantic-settings, structlog, uvicorn; nothing for similarity/URL/Unicode; `hashlib`/`unicodedata`/`difflib` (stdlib) suffice for this design |
@@ -184,14 +184,14 @@ DECISION P5].
 
 | | L1 same source | L2 exact raw content | L3 exact extracted text | L4 near duplicate |
 |---|---|---|---|---|
-| Input | all documents | documents with a well-formed `content_sha256` (fetch `OK`) | `status == SUCCESS`, non-empty `text`, `text_sha256` verified against `text` (P8a) | — |
+| Input | all documents | documents whose `content_sha256` is present and well-formed (64 lower-case hex), used as given — never verified (P8). S06 does not check `fetch_status`: in the pipeline S04 sets the hash only for `OK` fetches with a body (§25, F-3) | `status == SUCCESS`, non-empty `text`, `text_sha256` verified against `text` (P8a) | — |
 | Key | `source_identity` | `content_sha256` | `text_sha256` | — |
 | Rule | equal key, ≥ 2 members | equal key, ≥ 2 members | equal key, ≥ 2 members | **not implemented in S06** [APPROVED DECISION P4] |
 | Representative | lowest input position [APPROVED DECISION P6] | lowest input position | lowest input position | — |
 | Provenance | every member reference (§9) | every member | every member | — |
 | Group warnings [RECOMMENDATION] | `SOURCE_CONTENT_DIFFERS` (members' `content_sha256` differ, e.g. page changed between fetches), `MIXED_FETCH_STATUS` | `RAW_DUPLICATE_TEXT_DIFFERS` (members' `text_sha256` differ — E3), `CROSS_SOURCE_DUPLICATE` | `CROSS_SOURCE_DUPLICATE` (members from > 1 source identity / host — E6) | — |
 | Exclusions [RECOMMENDATION] | `INVALID_SOURCE_URL` | `NO_CONTENT_HASH`, `INVALID_CONTENT_HASH` | `NOT_SUCCESS` (incl. `PARTIAL` — E5), `EMPTY_TEXT`, `TEXT_HASH_MISMATCH`, `MISSING_TEXT_HASH`, `TEXT_HASH_UNVERIFIABLE` | — |
-| False positive risk | none beyond the normalizer's contract (same normalized URL = same resource) | identical non-content responses (interstitials, error pages) | identical non-content pages; truncation (excluded) | — |
+| False positive risk | none beyond the normalizer's contract (same normalized URL = same resource) | identical non-content responses served as `OK` (interstitials / bot challenges, soft error pages with HTTP 200) | identical non-content pages; truncation (excluded) | — |
 | False negative risk | non-listed tracking params, `www.`/slash variants (E1, E6) | any byte difference (timestamps, nonces) | any text difference (E2: one word, case, markup) | — |
 
 - **Why L1 is still needed after S01's pre-fetch dedup**: S01 groups *search URLs*; S06 groups *fetched
@@ -280,18 +280,18 @@ Nothing is ever merged into a synthetic document.
 | Situation | Behaviour [RECOMMENDATION P16] |
 |---|---|
 | A document's key cannot be derived (invalid URL, missing / mismatching / unverifiable `text_sha256` (§5.1), malformed `content_sha256`, text longer than S05's configurable maximum of 10 M chars) | document **kept** in `documents`/`refs`; excluded from that level with a reason; error code recorded; never merged on a doubtful key (fail closed for merging) |
-| `NOT_FETCHED` / `UNSUPPORTED` / `FAILED` / `EMPTY` / `PARTIAL` documents | kept; take part in L1 (and L2 when bytes were fetched); excluded from L3 with a reason (P3) |
+| `NOT_FETCHED` / `UNSUPPORTED` / `FAILED` / `EMPTY` / `PARTIAL` documents | kept; take part in L1, and in L2 when they carry a well-formed `content_sha256` (from S04: fetched `OK` with a body — `UNSUPPORTED` / `FAILED` / `EMPTY` / `PARTIAL` can; `NOT_FETCHED` never does); excluded from L3 with a reason (P3) |
 | Input is not a sequence of `ExtractedDocument` | `TypeError` before processing (programming error, not data) |
 | Unexpected exception | propagates; never an empty or "no duplicates" result. When integrated, the caller records a stage error (e.g. `DEDUP_FAILED`) — JobRunner contract unchanged in S06 |
 | Deadline / cancellation | **no S06 deadline** [APPROVED DECISION P12]; synchronous function (P15b). Measured: verification of 1 G chars ≈ 2.9 s (E8); 800 documents at the S05 *default* cap (800 M chars) extrapolates to ≈ 2.3 s. Time bounds for the whole pipeline stage belong to the integration (OD-14), not to S06 |
-| Memory | references only; peak growth ≤ 4.6 MB at 10 000 documents (E8); verification encodes one text at a time (≤ 4 bytes/char) |
+| Memory | references only; peak growth ≤ 4.6 MB at 10 000 documents (E8, prototype; as-built ≈ 24 MB per call at 10 000 documents — §25); verification encodes one text at a time (≤ 4 bytes/char) |
 
 ### 11.1 Document limit and deadline (OD-8 / OD-8b closed → P12)
 
 | Question | Answer (evidence) |
 |---|---|
 | Upstream bound today | ≤ 800 search hits per job (8 queries × 50 results × 2 providers, §2.2), already deduplicated by URL in S01; one ExtractedDocument per fetched URL |
-| S06's own cost | grouping is O(n): 10 000 documents in ≤ 135 ms with ≤ 4.6 MB peak growth (E8). The only text-proportional cost is `text_sha256` verification (≈ 2.1–2.9 ms per 1 M chars, E8/E11) |
+| S06's own cost | grouping is O(n): 10 000 documents in ≤ 135 ms with ≤ 4.6 MB peak growth (E8, prototype; as-built figures in §25). The only text-proportional cost is `text_sha256` verification (≈ 2.1–2.9 ms per 1 M chars, E8/E11) |
 | Does a count limit bound the real cost? | no — verification cost follows total characters, not document count; memory for texts is held by the caller before S06 runs |
 | Decision | **no S06 document-count limit, no S06 deadline** [APPROVED DECISION P12]; input-contract checks only (type, text length ≤ S05's 10 M-char maximum, hash format). No truncation, no partial results |
 | What the benchmark does **not** show | the 10 000-document result measures **grouping overhead** only. It does **not** show that every text volume is safe: verification is linear in total characters and was measured up to **1 G chars** (≈ 2.9 s, ≈ 2 GB of input held by the caller). Larger totals — e.g. 800 documents at the 10 M-char S05 *configurable maximum* = 8 G chars — were **not** measured and are **not** claimed safe |
@@ -334,7 +334,11 @@ Shared sandbox: run-to-run noise of ±2 s was observed in earlier sprints for mu
 | 100 | unique / exact | pathological 1 M (combining marks) | 100 M | 237 MB | 0.6 ms | 306 ms |
 | 1 000 | unique | pathological 1 M | 1 000 M | 1 959 MB | 8.7 ms | 2 922 ms |
 
-Peak RSS growth of the grouping step: ≤ 4.6 MB in every scenario. 10 000 × 1 M-char pathological
+_Historical baseline: the table and figures in this section are **prototype** measurements (E8), taken
+before implementation; they are kept as the design basis. The as-built measurements in §25 supersede
+them for the implementation._
+
+Peak RSS growth of the grouping step: ≤ 4.6 MB in every scenario (prototype). 10 000 × 1 M-char pathological
 documents (≈ 20 GB of input) was not run: the *inputs* exceed this machine, S06 is not the bottleneck.
 
 Performance budgets for the implementation's benchmark test, derived from E8 [RECOMMENDATION]: at 2 000
@@ -559,21 +563,44 @@ URL grouped, bad content hash grouped, L3 errors hidden), N11 (stored hash used,
 stored hash, skip when raw hash seen), N12, N13, N14 (trust, kind), N15, N16, N17, N18, N19, N20 (document
 limit, member cap).
 
-**Benchmark (§13, subprocess per scenario, best of 3, VmHWM reset).**
+**Benchmark — as-built measurement (supersedes the E8 prototype figures of §13 for the implementation).**
+Method: `tests/dedup_support.py` / `test_dedup_benchmark.py`, one subprocess per scenario, inputs built
+first, VmHWM reset, then `group_documents` called 3 times (best time kept; peak RSS over the 3 calls).
+Machine: the shared Linux sandbox of this sprint, Python 3.11; synthetic `ExtractedDocument`s with
+distinct hosts and valid hashes (`short_2000`: short texts in groups of 5; `large_2000`: unique
+≈ 100 k-char Vietnamese texts, every text hash re-verified; `groups_10000`: short texts in groups of 5).
 
-| Scenario | Docs | Input chars | Time | Peak RSS growth | Budget |
-|---|---|---|---|---|---|
-| short_2000 | 2 000 | 77 450 | 0.044 s | 9.8 MB | ≤ 0.5 s, ≤ 32 MB — met |
-| large_2000 (~100 k chars each, verification incl.) | 2 000 | 197 406 890 | 0.403 s | 7.7 MB | ≤ 5 s, ≤ 32 MB — met |
-| groups_10000 | 10 000 | 154 450 | 0.239 s | 45.5 MB | completeness only (no budget) — complete |
+| Scenario | Docs | Input chars | Time, best of 3 (run 1 / review re-run) | Peak RSS growth over 3 calls (run 1 / re-run) | Single call peak RSS growth | Budget (§13) |
+|---|---|---|---|---|---|---|
+| short_2000 | 2 000 | 77 450 | 0.044 s / 0.044 s | 9.8 MB / 9.8 MB | 5.0 MB | ≤ 0.5 s, ≤ 32 MB — met |
+| large_2000 | 2 000 | 197 406 890 | 0.403 s / 0.392 s | 7.7 MB / 7.8 MB | 4.3 MB | ≤ 5 s, ≤ 32 MB — met |
+| groups_10000 | 10 000 | 154 450 | 0.239 s / 0.248 s | 45.5 MB / 45.5 MB | 24.2 MB | completeness only (no budget) — complete |
 
-Machine-dependent; budgets are assertions in `test_dedup_benchmark.py`.
+- **Prototype vs as-built.** E8 (prototype: keys in dicts, no output models) measured ≤ 135 ms and
+  ≤ 4.6 MB at 10 000 documents. The implementation is ≈ 2× slower and holds ≈ 2.1 KB per document
+  (`tracemalloc`: 20.5 MiB retained at 10 000 documents, 84 % in pydantic model instances — one
+  `DocumentRef` per document plus groups). These as-built figures are the confirmed ones.
+- **Why two RSS columns.** The benchmark keeps the previous `DocumentSet` alive while the next call
+  builds its own, so its peak covers two results (45.5 MB); one call alone grows by 24.2 MB at 10 000
+  documents. The assertion uses the conservative 3-call figure; the harness is unchanged.
+- **Limits.** Machine-dependent; the budgets are regression assertions at 2 000 documents, not a runtime
+  limit (P12). Text volume beyond the measured inputs (≈ 197 M chars here, ≈ 1 G chars in E8) is not
+  claimed safe (§11.1); total-volume bounds remain OD-14. Input memory is the caller's.
 
 **Real web (§17).** `RUN_LIVE_NETWORK=1`, TLS verification on (proxy CA via `CRAWL_CA_BUNDLE`), egress
 policy not bypassed; PASS. PyPI `…/httpx/`, `?utm_source=probe`, `#history` → one group of 3 at L1, L2
 and L3; `…/0.28.1/` → in no group with them; `…/project/httpx` and `…/project/HTTPX/` → L2 and L3 group
 of two with `CROSS_SOURCE_DUPLICATE` (challenge pages with `LOW_CONFIDENCE_MAIN_CONTENT`; recorded, not
 "fixed", §23); no exclusions, no errors.
+
+**Post-implementation review of `ae7218f` (findings and disposition).**
+
+| Id | Severity | Finding | Disposition |
+|---|---|---|---|
+| F-1 | MEDIUM | `tests/live/test_dedup_live.py` passed with every fetch failed (6× `TLS_ERROR` without `CRAWL_CA_BUNDLE`): `final_url` is set on failure and the remaining assertions were vacuous | **fixed (test only)**: every URL must be fetched `OK` with a body and extracted `SUCCESS` before any dedup assertion; L1, L2 and L3 must each contain the group `[0, 1, 2]`; the version page is in no group with it. Assertions live in `check_live_dedup`, proven offline by `tests/unit/test_dedup_live_checks.py` (16 tests: TLS / HTTP / connection failure, missing body or hash, wrong grouping all fail; a §17-conforming run passes). Live re-run after the fix: FAIL without `CRAWL_CA_BUNDLE` (`TLS_ERROR`), PASS with it (6/6 fetched `OK`, extracted `SUCCESS`) |
+| F-2 | LOW | `RAW_DUPLICATE_TEXT_DIFFERS` (L2 warning) compares the members' stored, unverified `text_sha256` (§7 wording); a forged hash can add or hide the warning (only for documents not produced by S05) | **open — founder decision**; production semantics unchanged |
+| F-3 | LOW | §7 said L2 input is "fetch `OK`", §11 said "when bytes were fetched"; code checks hash presence and format only | **documentation clarified** (§7, §11): S06 uses the well-formed hash as given and does not check `fetch_status`; S04 sets it only for `OK` fetches with a body; L2 never verifies raw bytes; `OK` interstitials / soft error pages remain an L2 false-positive risk |
+| F-4 | LOW | §11/§11.1/§13 carried prototype figures (E8) without reconciliation with the as-built benchmark | **documentation clarified**: §13/E8 marked as historical prototype baseline; as-built figures above are the confirmed ones |
 
 **Not done / unverified (unchanged, §15.1).** End-to-end order S01 → crawler → extraction → S06 and the
 claim "representative = best-ranked hit" (OD-13); total-volume / stage-time bounds of the integrated
